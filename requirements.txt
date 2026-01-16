@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+opencv-python
+ultralytics
+watchdog
+pillow
+imageio
+imageio-ffmpeg
