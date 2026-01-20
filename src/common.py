@@ -45,7 +45,11 @@ def ensure_dirs():
     for path in [INBOX_DIR, PROCESSED_DIR, ALERTS_DIR, MEDIA_DIR, GIF_QUEUE_DIR, LOGS_DIR]:
         path.mkdir(parents=True, exist_ok=True)
 
-def file_is_stable(path: Path, stable_seconds: int = 8, poll_seconds: int = 2) -> bool:
+def file_is_stable(
+        path: Path, 
+        stable_seconds: int = 8,
+        poll_seconds: int = 2
+        ) -> bool:
     """
     Returns True if a file's size stays unchanged for `stable_seconds`.
 
@@ -63,14 +67,22 @@ def file_is_stable(path: Path, stable_seconds: int = 8, poll_seconds: int = 2) -
         True if stable False otherwise.
     """
     try:
-        size1 = path.stat().st_size
-    except: FileNotFoundError:
+        initial_size_in_bytes = path.stat().st_size
+    except FileNotFoundError:
         return False
-
+    
     waited = 0
     while waited < stable_seconds:
         time.sleep(poll_seconds)
         waited += poll_seconds
 
         try:
-            size2 = path.stat().st_size
+            resoluting_size_in_bytes = path.stat().st_size
+        except FileNotFoundError:
+            return False
+        
+        # If file size changed, Tesla is still writing; reset stability winow
+        if initial_size_in_bytes != resoluting_size_in_bytes:
+            initial_size_in_bytes = resoluting_size_in_bytes
+            waited = 0
+    return True
