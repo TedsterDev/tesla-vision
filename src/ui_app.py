@@ -28,13 +28,13 @@ from src.common import (
 )
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def tesla_dashboard_app_lifespan(app: FastAPI):
     # On Start-Up
     ensure_dirs()
     yield
     # Shutdown (nothing to do yet)
 
-app = FastAPI(title="Tesla Alerts Dashboard")
+app = FastAPI(title="Tesla Alerts Dashboard", lifespan=tesla_dashboard_app_lifespan)
 
 # Serve files in /data/media at /media/<filename>
 app.mount("/media", StaticFiles(directory=str(MEDIA_DIR)), name="media")
