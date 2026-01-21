@@ -32,7 +32,7 @@ TESLACAM_DIR = env_path("TESLACAM_DIR", str(Path("/mnt/teslacam/TeslaCam")))
 INBOX_DIR = BASE_DIR / "inbox"          # where we copy stable clips for processing
 PROCESSED_DIR = BASE_DIR / "processed"  # processed clips moved here
 ALERTS_DIR = BASE_DIR / "alerts"        # alert metadata JSON files
-MEDIA_DIR = BASE_DIR / "media"          # output of JPEGs + GIFSs
+MEDIA_DIR = BASE_DIR / "media"          # output of JPEGs + GIFs
 JOBS_DIR = BASE_DIR / "jobs"            # job-related files
 GIF_QUEUE_DIR = JOBS_DIR / "gif_queue"  # JSON job files for GIF worker
 LOGS_DIR = BASE_DIR / "logs"            # optional log files
@@ -42,7 +42,7 @@ def ensure_dirs():
     Create all required directories if they don't exist.
     Safe to call repeatedly
     """
-    for path in [INBOX_DIR, PROCESSED_DIR, ALERTS_DIR, MEDIA_DIR, GIF_QUEUE_DIR, LOGS_DIR]:
+    for path in [INBOX_DIR, PROCESSED_DIR, ALERTS_DIR, MEDIA_DIR, JOBS_DIR, GIF_QUEUE_DIR, LOGS_DIR]:
         path.mkdir(parents=True, exist_ok=True)
 
 def file_is_stable(
@@ -77,12 +77,12 @@ def file_is_stable(
         waited += poll_seconds
 
         try:
-            resoluting_size_in_bytes = path.stat().st_size
+            resulting_size_in_bytes = path.stat().st_size
         except FileNotFoundError:
             return False
         
         # If file size changed, Tesla is still writing; reset stability winow
-        if initial_size_in_bytes != resoluting_size_in_bytes:
-            initial_size_in_bytes = resoluting_size_in_bytes
+        if initial_size_in_bytes != resulting_size_in_bytes:
+            initial_size_in_bytes = resulting_size_in_bytes
             waited = 0
     return True
