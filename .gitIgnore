@@ -24,6 +24,6 @@ dist/
 .env.*
 !.env.example
 
-# OS/editor (optional)
+# OS/editor
 .DS_Store
 .vscode/
