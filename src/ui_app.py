@@ -53,7 +53,7 @@ app = FastAPI(title="Tesla Alerts Dashboard", lifespan=tesla_dashboard_app_lifes
 # Configure via environment variables (recommended via docker-compose + .env):
 #   DASHBOARD_USER (default: "")
 #   DASHBOARD_PASS (no default; if unset/empty, auth is DISABLED)
-DASHBOARD_USER = os.environ.get("DASHBOARD_USER", "")
+DASHBOARD_USER = os.environ.get("DASHBOARD_USER", "").strip()
 DASHBOARD_PASS = os.environ.get("DASHBOARD_PASS", "").strip()
 AUTH_ENABLED = bool(DASHBOARD_PASS)
 
@@ -79,6 +79,14 @@ async def require_basic_auth(request: Request, call_next):
     # Always allow health checks
     if request.url.path in ("/healthz"):
         return await call_next(request)
+    
+    if request.url.path in (
+        "/favicon.ico",
+        "/apple-touch-icon.png",
+        "/apple-touch-icon-precomposed.png",
+    ):
+        return await call_next(request)
+
 
     # If no password is configured, leave the dashboard open (backwards compatible).
     # Set DASHBOARD_PASS to enable protection.
