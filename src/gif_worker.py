@@ -72,12 +72,16 @@ def make_gif_ffmpeg(video_path: Path, out_gif: Path) -> None:
 def save_json(path: Path, obj: dict) -> None:
     path.write_text(json.dumps(obj, indent=2), encoding="utf-8")
 
-def update_alert_status(alert_id, status: str, **updates) -> None:
+def update_alert_status(alert_id: str, status: str, **updates) -> None:
+    """
+    Updates an existing alert JSON with a new status and any other additional fields.
+    """
     alert_path = ALERTS_DIR / f"{alert_id}.json"
     if not alert_path.exists():
         return
 
     alert = load_json(alert_path)
+    alert["status"] = status
     alert.update(updates)
     save_json(alert_path, alert)
 
@@ -93,10 +97,10 @@ def main():
             GIF_QUEUE_DIR
             .glob(
                 "*.json", 
-                key=lambda 
-                    path_object:path_object
-                    .stat()     # Asks the OS for file metadata
-                        .st_mtime))  # make it in epoch seconds
+            key=lambda 
+                path_object: path_object
+                .stat()     # Asks the OS for file metadata
+                    .st_mtime))  # make it in epoch seconds
 
         if not jobs:
             time.sleep(0.5)
@@ -117,8 +121,8 @@ def main():
 
         try:
             job = load_json(claimed)
-            alert_id = str(job.get("alert_id", "").strip())
-            video_str = str(job.get("video", "").strip())
+            alert_id = str(job.get("alert_id", "")).strip()
+            video_str = str(job.get("video", "")).strip()
 
             if not alert_id:
                 raise ValueError("job missing alert_id")
@@ -126,7 +130,7 @@ def main():
                 raise ValueError("job missing video string")
             
             video_path = resolve_video_path(video_str)
-            if not video_path.exist():
+            if not video_path.exists():
                 raise FileNotFoundError(f"video not found: {video_str} (also tried {PROCESSED_DIR / Path(video_str).name})")
             
             out_gif = MEDIA_DIR / f"{alert_id}.gif"
@@ -145,8 +149,10 @@ def main():
         except Exception as exception_object:
             print(f"[🎞️ gif_worker] FAILED {claimed.name}: {exception_object}")
             update_alert_status(alert_id, status="gif_failed")
+            if alert_id:
+                update_alert_status(alert_id, status="gif_failed")            
 
-            failed = claimed.with_suffix(".json.done")
+            failed = claimed.with_suffix(".json.failed")
             try:
                 claimed.replace(failed)
             except Exception:
