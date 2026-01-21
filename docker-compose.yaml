@@ -1,3 +1,5 @@
+version: "3.8"
+
 services:
   processor:
     build:
@@ -8,8 +10,10 @@ services:
       - /mnt/jetsondata/tesla-alerts:/data
       - /mnt/teslacam:/teslacam:ro
     environment:
+      - PYTHONPATH=/app
       - BASE_DIR=/data
       - TESLACAM_DIR=/teslacam/TeslaCam
+      - YOLO_CONFIG_DIR=/data/.config/Ultralytics
     restart: unless-stopped
 
   gif_worker:
@@ -20,6 +24,7 @@ services:
     volumes:
       - /mnt/jetsondata/tesla-alerts:/data
     environment:
+      - PYTHONPATH=/app
       - BASE_DIR=/data
     restart: unless-stopped
 
@@ -27,11 +32,13 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile
-    command: ["uvicorn", "src.ui_app:app", "--host", "0.0.0.0", "--port", "8080"]
+    command:
+      ["uvicorn", "src.ui_app:app", "--host", "0.0.0.0", "--port", "8080"]
     ports:
       - "8080:8080"
     volumes:
       - /mnt/jetsondata/tesla-alerts:/data
     environment:
       - BASE_DIR=/data
+      - PYTHONPATH=/app
     restart: unless-stopped
