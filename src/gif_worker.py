@@ -94,13 +94,9 @@ def main():
         # Process oldest job (global pattern matching on *.json files) first for fairness (by mtime)
         # - uses stat().st_mtime (like using ls -l) to sort by time
         jobs = sorted(
-            GIF_QUEUE_DIR
-            .glob(
-                "*.json", 
-            key=lambda 
-                path_object: path_object
-                .stat()     # Asks the OS for file metadata
-                    .st_mtime))  # make it in epoch seconds
+            GIF_QUEUE_DIR.glob("*.json"),
+            key=lambda p: p.stat().st_mtime, # Asks the OS for file metadata . make it into epoch seconds
+        )
 
         if not jobs:
             time.sleep(0.5)
@@ -114,11 +110,14 @@ def main():
             job_file.replace(claimed)
         except FileNotFoundError:
             continue # Race Condition - Do not claim
-        except Exception as expection_object:
-            print(f"[🎞️ gif_worker] ERROR claiming {job_file.name}: {expection_object}")
+        except Exception as exception_object:
+            print(f"[🎞️ gif_worker] ERROR claiming {job_file.name}: {exception_object}")
             time.sleep(0.5)
             continue
 
+        # Initializing before the try
+        job = {}
+        alert_id = ""
         try:
             job = load_json(claimed)
             alert_id = str(job.get("alert_id", "")).strip()
@@ -148,7 +147,6 @@ def main():
 
         except Exception as exception_object:
             print(f"[🎞️ gif_worker] FAILED {claimed.name}: {exception_object}")
-            update_alert_status(alert_id, status="gif_failed")
             if alert_id:
                 update_alert_status(alert_id, status="gif_failed")            
 
