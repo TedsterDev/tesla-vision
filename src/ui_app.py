@@ -38,6 +38,12 @@ from src.common import (
 async def tesla_dashboard_app_lifespan(app: FastAPI):
     # On Start-Up
     ensure_dirs()
+    if AUTH_ENABLED and not DASHBOARD_USER:
+        raise RuntimeError("DASHBOARD_PASS is set but DASHBOARD_USER is empty. Set DASHBOARD_USER to enable auth.")
+    if AUTH_ENABLED:
+        print(f"[🔐 ui] Basic Auth ENABLED user={DASHBOARD_USER}")
+    else:
+        print("[🔐 ui] Basic Auth DISABLED (set DASHBOARD_PASS to enable)")
     yield
     # Shutdown (nothing to do yet)
 
@@ -49,10 +55,10 @@ app = FastAPI(title="Tesla Alerts Dashboard", lifespan=tesla_dashboard_app_lifes
 #   DASHBOARD_PASS (no default; if unset/empty, auth is DISABLED)
 DASHBOARD_USER = os.environ.get("DASHBOARD_USER", "")
 DASHBOARD_PASS = os.environ.get("DASHBOARD_PASS", "").strip()
-
+AUTH_ENABLED = bool(DASHBOARD_PASS)
 
 def _constant_time_equal(time_a: str, time_b: str) -> bool:
-    return hmac.compare_digest(time_a.encode("utf-8"), time_a.encode("utf-8"))
+    return hmac.compare_digest(time_a.encode("utf-8"), time_b.encode("utf-8"))
 
 
 def _parse_basic_auth(auth_header: str) -> tuple[str, str] | None:
