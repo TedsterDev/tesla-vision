@@ -36,6 +36,7 @@ services:
       - "8080:8080"
     volumes:
       - /mnt/jetsondata/tesla-alerts:/data
+    env_file: .env
     environment:
       - BASE_DIR=/data
       - PYTHONPATH=/app
