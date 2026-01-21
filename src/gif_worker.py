@@ -25,10 +25,10 @@ GIF_SECONDS = 5
 FPS = 10            # Set Frames per Second (Lower == Smaller GIF)
 SCALE_WIDTH = 640
 
-def load_json(path: Path):
+def load_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
-def resolve_video_path(video_str: str):
+def resolve_video_path(video_str: str) -> Path:
     """
     Processor currently enqueues the INBOX path, then moves the file into PROCESSED_DIR
     This resolver is robust:

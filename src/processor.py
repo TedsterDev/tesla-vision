@@ -212,7 +212,7 @@ def main():
 
     # Start with the small YOLO model for speed. Later we can swap for TensorRT.
     # First run will download weights into the container layer (or cache).
-    model = YOLO("yolov8n.pt")
+    model = YOLO("yolo26n.pt")
 
     # Track TeslaCam files we've already considered so we don't re-check endlessly.
     # Note: If we delete old clips or rotate folders, we have to revisit this logic.
