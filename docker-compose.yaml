@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   processor:
     build:
@@ -13,7 +11,7 @@ services:
       - PYTHONPATH=/app
       - BASE_DIR=/data
       - TESLACAM_DIR=/teslacam/TeslaCam
-      - YOLO_CONFIG_DIR=/data/.config/Ultralytics
+      - YOLO_CONFIG_DIR=/data/.config
     restart: unless-stopped
 
   gif_worker:
