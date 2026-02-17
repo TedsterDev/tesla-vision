@@ -27,3 +27,6 @@ dist/
 # OS/editor
 .DS_Store
 .vscode/
+
+# Sensitive WiFi Info
+config/wifi_priority.conf
