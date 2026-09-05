@@ -127,6 +127,58 @@ MPH_PER_KNOT = 1.150779
 
 RECONNECT_DELAY_SECONDS = 5
 
+# --- Motion detection ------------------------------------------------------
+# Driving-vs-parked is decided by DISPLACEMENT, not by instantaneous speed.
+#
+# Speed alone was the first implementation and it was wrong 96% of the time.
+# Measured on this receiver, sitting still on a desk for 3.3 minutes:
+#
+#     speed mph   p50 1.19   p95 2.07   max 3.46
+#     above MOVING_SPEED_THRESHOLD_MPH (1.0):  26 of 27 samples
+#     scatter from centroid:  p50 5.3m   p95 8.6m   max 13.0m
+#     summed steps 86.2m vs net displacement 5.5m  ->  15.7x
+#
+# A stationary consumer receiver reports a random walk of roughly 0.5-3.5 mph
+# forever. That threshold was calibrated against the Fleet API, where a parked
+# car reports drive_state.speed = None: Tesla says nothing, a GNSS says noise.
+# Left alone it opened a drive on a desk and fabricated 23.6 miles a day, and
+# distinct_drives is the single heaviest signal correlate.py scores on - so
+# every repeat sighting in the owner's own driveway would have accumulated
+# "seen on N separate drives" and started scoring like a tail.
+#
+# Path/net RATIO was the obvious next idea and it does not survive windowing.
+# Over the whole series it reads 15.7x, but over a window short enough to
+# notice a drive promptly it collapses into the driving range:
+#
+#     window ~42s:   ratio min 1.4   (real driving is 1.0-1.5)
+#     window ~176s:  ratio min 2.8   - separates, but 3 minutes too late
+#
+# A random walk sometimes wanders roughly straight; that is a property of the
+# walk, not of the sample size, so more data does not rescue it.
+#
+# Net displacement does not have that problem. Noise grows as sqrt(time) and
+# stayed under 18m over 42s, while a car at even 5 mph covers 94m in the same
+# window. The threshold sits between those with margin on both sides, and the
+# detection latency falls out of it for free: it is the time taken to travel
+# GPS_MOTION_ENTER_METERS, so ~22s at a parking-lot crawl and ~4s at 30 mph.
+GPS_MOTION_WINDOW_SECONDS = env_int("GPS_MOTION_WINDOW_SECONDS", 45)
+
+# 2.8x the measured stationary maximum (17.9m over a 42s window).
+GPS_MOTION_ENTER_METERS = env_float("GPS_MOTION_ENTER_METERS", 50.0)
+
+# Schmitt trigger: leaving 'driving' needs a LOWER bar than entering it, held
+# for a while. Without the gap, a car waiting at a long red light flaps between
+# D and P, and each flip drops the write cadence from GPS_MOVING_SAMPLE_SECONDS
+# to GPS_PARKED_SAMPLE_SECONDS - so the stop-and-go traffic where you most want
+# to know who is behind you is exactly where the track would go sparse.
+GPS_MOTION_EXIT_METERS = env_float("GPS_MOTION_EXIT_METERS", 20.0)
+GPS_MOTION_EXIT_HOLD_SECONDS = env_int("GPS_MOTION_EXIT_HOLD_SECONDS", 90)
+
+# Below this many fixes the window cannot say anything, and the safe answer is
+# 'parked': a false 'P' loses a few seconds off the front of a drive, a false
+# 'D' invents a journey that never happened.
+GPS_MOTION_MIN_SAMPLES = env_int("GPS_MOTION_MIN_SAMPLES", 4)
+
 
 # ---------------------------------------------------------------------------
 # NMEA parsing
@@ -256,7 +308,16 @@ class Fix:
 
     @property
     def status(self) -> str:
-        """'D' or 'P'. Never 'C' - a GPS cannot see a charge port."""
+        """
+        What THIS ONE SAMPLE says, from speed alone. 'D' or 'P'. Never 'C' -
+        a GPS cannot see a charge port.
+
+        This is not what gets written to the database. A single sample cannot
+        tell a moving car from a stationary receiver's noise, because both
+        report a non-zero speed; MotionGate decides that over a window, and
+        main() writes the gate's verdict. Kept because it is the honest
+        answer to "what did this fix report", which is what describe() wants.
+        """
         return "D" if self.speed_mph > MOVING_SPEED_THRESHOLD_MPH else "P"
 
     def describe(self) -> str:
@@ -273,6 +334,140 @@ class Fix:
             f"@ {self.lat:.5f},{self.lon:.5f} "
             f"({self.satellites} sats, hdop {self.hdop or 0:.1f})"
         )
+
+
+class MotionGate:
+    """
+    Decides driving-vs-parked from where the receiver has actually got to.
+
+    Fed every valid fix - at the receiver's 1Hz, NOT at the database write
+    cadence. That separation is what makes the latency acceptable: the gate is
+    already certain by the time the next row is due, and a car pulling away
+    from a light is back to 'D' within seconds rather than waiting out
+    GPS_PARKED_SAMPLE_SECONDS.
+
+    The measurement is the largest distance between any fix still inside the
+    window and the newest one - not oldest-to-newest, which reads zero for a
+    car that drives away and comes back inside the window, and not the summed
+    path, which is what noise inflates. For a stationary receiver it is bounded
+    by the scatter of the solution (~13m on this hardware); for a moving car it
+    grows without limit. See the constants above for the measured numbers.
+
+    Deliberately holds no fix quality logic. A gate that also refused to
+    believe HDOP > 4 would go silent in exactly the urban canyon where the
+    question matters, and bad geometry inflates the scatter it is already
+    measuring - it is not a separate failure to guard against.
+    """
+
+    def __init__(
+        self,
+        window_seconds: int = GPS_MOTION_WINDOW_SECONDS,
+        enter_meters: float = GPS_MOTION_ENTER_METERS,
+        exit_meters: float = GPS_MOTION_EXIT_METERS,
+        exit_hold_seconds: int = GPS_MOTION_EXIT_HOLD_SECONDS,
+        min_samples: int = GPS_MOTION_MIN_SAMPLES,
+    ) -> None:
+        self.window_seconds = window_seconds
+        self.enter_meters = enter_meters
+        self.exit_meters = exit_meters
+        self.exit_hold_seconds = exit_hold_seconds
+        self.min_samples = min_samples
+
+        self._points: deque = deque()
+        self._driving = False
+        self._below_exit_since: float | None = None
+        self.displacement_m = 0.0
+        self.path_m = 0.0
+
+    def reset(self) -> None:
+        """
+        Forget the window. Called on reconnect: the receiver may have been
+        away for hours, so the gap between the last old fix and the first new
+        one is not displacement anyone travelled continuously, and carrying it
+        across would open a drive on a replug.
+        """
+        self._points.clear()
+        self._driving = False
+        self._below_exit_since = None
+        self.displacement_m = 0.0
+        self.path_m = 0.0
+
+    def update(self, lat: float, lon: float, now: float) -> str:
+        """Feed one fix. Returns 'D' or 'P' - the value to write to `polls`."""
+        if lat is None or lon is None:
+            return "D" if self._driving else "P"
+
+        if self._points:
+            previous = self._points[-1]
+            self.path_m += _meters(previous[1], previous[2], lat, lon)
+
+        self._points.append((now, lat, lon))
+
+        cutoff = now - self.window_seconds
+        while len(self._points) > 1 and self._points[0][0] < cutoff:
+            self._points.popleft()
+
+        self.displacement_m = max(
+            (_meters(point[1], point[2], lat, lon) for point in self._points),
+            default=0.0,
+        )
+
+        # Recomputed over the surviving window rather than carried forward, so
+        # the ratio describes the same span the displacement does.
+        self.path_m = sum(
+            _meters(a[1], a[2], b[1], b[2])
+            for a, b in zip(self._points, list(self._points)[1:])
+        )
+
+        if len(self._points) < self.min_samples:
+            # Not enough to say. Note this cannot strand a drive already in
+            # progress, because the window only shrinks this far after a reset.
+            return "D" if self._driving else "P"
+
+        if not self._driving:
+            if self.displacement_m >= self.enter_meters:
+                self._driving = True
+                self._below_exit_since = None
+            return "D" if self._driving else "P"
+
+        if self.displacement_m <= self.exit_meters:
+            if self._below_exit_since is None:
+                self._below_exit_since = now
+            elif now - self._below_exit_since >= self.exit_hold_seconds:
+                self._driving = False
+                self._below_exit_since = None
+        else:
+            self._below_exit_since = None
+
+        return "D" if self._driving else "P"
+
+    @property
+    def path_ratio(self) -> float | None:
+        """
+        Summed steps over net displacement. Diagnostic only - it is on the
+        heartbeat because it makes the difference between "parked" and "broken"
+        legible to a human reading /gps, and useless as a decision variable for
+        the reason recorded above the constants.
+        """
+        if self.displacement_m < 1.0:
+            return None
+        return self.path_m / self.displacement_m
+
+    def snapshot(self) -> dict:
+        return {
+            "driving": self._driving,
+            "samples": len(self._points),
+            "displacement_m": round(self.displacement_m, 1),
+            "path_m": round(self.path_m, 1),
+            "path_ratio": round(self.path_ratio, 1) if self.path_ratio else None,
+            "enter_m": self.enter_meters,
+            "exit_m": self.exit_meters,
+        }
+
+
+def _meters(lat_a: float, lon_a: float, lat_b: float, lon_b: float) -> float:
+    """Metres between two fixes. geo.py owns the haversine; this is the unit."""
+    return haversine_miles(lat_a, lon_a, lat_b, lon_b) * 1609.344
 
 
 class NmeaAssembler:
@@ -396,13 +591,18 @@ class NmeaAssembler:
         return self.fix
 
 
-def poll_record_from_fix(fix: Fix) -> dict:
+def poll_record_from_fix(fix: Fix, status: str | None = None) -> dict:
     """
     Build a `polls` row from a fix, matching poller.poll_record_from_vehicle_data.
 
     The fields a GPS cannot know - power, shift_state, odometer - are None
     rather than 0.0, so a reader can tell "no source for this" apart from "the
     car reported zero".
+
+    `status` is MotionGate's verdict. It defaults to the fix's own speed-only
+    reading only so a caller holding a single Fix still gets a row; the service
+    always passes the gate's, because one sample cannot tell a slow car from a
+    stationary receiver's noise.
     """
     return {
         "id": uuid.uuid4().hex[:12],
@@ -413,7 +613,7 @@ def poll_record_from_fix(fix: Fix) -> dict:
         "speed": fix.speed_mph,
         "power": None,
         "shift_state": None,
-        "status": fix.status,
+        "status": status or fix.status,
         "loc_available": 1 if (fix.lat is not None and fix.lon is not None) else 0,
         "odometer": None,
         "street": None,
@@ -453,6 +653,7 @@ _HEARTBEAT_ENABLED = False
 # so main()'s loop body never executes and anything it owned would freeze.
 _STATE: dict = {
     "assembler": None,
+    "gate": None,
     "port_open": False,
     "last_error": None,
     "last_error_ts": None,
@@ -615,6 +816,11 @@ def _heartbeat_payload() -> dict:
     """
     assembler = _STATE["assembler"]
     fix = assembler.fix if assembler is not None else Fix()
+    # Same reasoning as the empty SkyView below: a real gate with an empty
+    # window, so the key set cannot drift from what snapshot() returns. Without
+    # it, "parked" and "the gate never ran" render identically on /gps - which
+    # is the distinction this whole file exists to keep visible.
+    gate = _STATE["gate"] or MotionGate()
     # An empty SkyView rather than a hand-written dict of nulls, so this path
     # cannot drift out of step with the eight keys snapshot() actually returns.
     sky = (assembler.sky if assembler is not None else SkyView()).snapshot(
@@ -635,6 +841,7 @@ def _heartbeat_payload() -> dict:
         "sentences_total": _STATE["sentences_total"],
         "checksum_failures": _STATE["checksum_failures"],
         "last_sentence_ts": _STATE["last_sentence_ts"],
+        "motion": gate.snapshot(),
         "fix_valid": bool(fix.valid),
         "fix_quality": fix.quality,
         "satellites_used": fix.satellites,
@@ -803,6 +1010,13 @@ def read_sentences(path: str):
         # report "GPS service dead" for a service that is alive and waiting,
         # which is precisely the wrong diagnosis and the wrong remedy.
         _STATE["port_open"] = False
+        # The window is now a lie: its newest fix is from before the outage,
+        # and the next one may be hours and miles later. Left alone, the first
+        # fix after a replug reads as an enormous displacement and opens a
+        # drive that never happened - the exact failure this gate exists to
+        # prevent, arriving through the back door.
+        if _STATE["gate"] is not None:
+            _STATE["gate"].reset()
         _beat(force=True)
         time.sleep(RECONNECT_DELAY_SECONDS)
 
@@ -822,6 +1036,8 @@ def main() -> int:
 
     assembler = NmeaAssembler()
     _STATE["assembler"] = assembler
+    gate = MotionGate()
+    _STATE["gate"] = gate
 
     if status_mode:
         # Diagnostics only - touches no database, and _HEARTBEAT_ENABLED is
@@ -893,7 +1109,11 @@ def main() -> int:
                     last_unfixed_report_at = now
                 continue
 
-            if previous_fix_status == "D" and fix.status == "P":
+            # Fed at the receiver's rate, above the write-cadence gate below,
+            # so the verdict is settled before a row is ever due.
+            motion_status = gate.update(fix.lat, fix.lon, now)
+
+            if previous_fix_status == "D" and motion_status == "P":
                 # The car has just stopped. The module docstring promises a
                 # geocode "when it settles into being parked" and the distance
                 # gate alone never delivers one: the last lookup sits roughly
@@ -906,17 +1126,17 @@ def main() -> int:
                 # because the sample-interval gate below is about to skip this
                 # iteration and a lookup here would be thrown away.
                 geocode_on_park = True
-            previous_fix_status = fix.status
+            previous_fix_status = motion_status
 
             interval = (
-                GPS_MOVING_SAMPLE_SECONDS if fix.status == "D"
+                GPS_MOVING_SAMPLE_SECONDS if motion_status == "D"
                 else GPS_PARKED_SAMPLE_SECONDS
             )
             if now - last_written_at < interval:
                 continue
             last_written_at = now
 
-            poll = poll_record_from_fix(fix)
+            poll = poll_record_from_fix(fix, status=motion_status)
             poll["drive_id"] = attach_drive(connection, poll)
 
             # Distance-gated, not sample-gated. See the module docstring.

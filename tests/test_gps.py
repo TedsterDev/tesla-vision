@@ -265,6 +265,7 @@ HEARTBEAT_KEYS = (
     "device", "device_present", "port_open",
     "last_error", "last_error_ts",
     "sentences_total", "checksum_failures", "last_sentence_ts",
+    "motion",
     "fix_valid", "fix_quality", "satellites_used",
     "satellites_in_view", "satellites_tracked",
     "hdop", "pdop", "vdop", "gsa_fix_type", "gsa_used_prns",
@@ -460,6 +461,148 @@ def test_the_no_fix_line_does_not_call_used_satellites_visible():
     assert "visible" not in assembler.fix.describe()
     combined = assembler.describe()
     assert "1 in view" in combined and "1 tracked" in combined and "0 used" in combined
+
+
+# ---------------------------------------------------------------------------
+# Motion detection
+# ---------------------------------------------------------------------------
+# These exist because 31 passing tests did not stop the shipped code marking a
+# receiver on a desk as driving on 201 of 202 consecutive samples. Every test
+# above asked "did we parse this sentence correctly", and every one was right.
+# None asked "does a sequence of correct fixes mean the car is moving", which
+# is a question no single sentence can answer.
+#
+# The numbers below are measured, not chosen: 33 minutes of this receiver
+# sitting still produced a peak displacement of 13.9m and speeds up to 3.46mph.
+
+METERS_PER_DEGREE_LAT = 111320.0
+
+
+def stationary_track(seconds: int, scatter_m: float = 7.0):
+    """
+    A receiver that is not moving, reported the way one actually reports.
+
+    The walk is deterministic rather than random so a failure is reproducible;
+    what matters is the amplitude, which is set from the measured p95 scatter.
+    """
+    step = scatter_m / METERS_PER_DEGREE_LAT
+    offsets = [(0.0, 0.0), (step, -step * 0.6), (-step * 0.7, step * 0.8),
+               (step * 0.5, step), (-step, -step * 0.4), (step * 0.3, -step * 0.9)]
+    for tick in range(seconds):
+        north, east = offsets[tick % len(offsets)]
+        yield float(tick), 33.1696 + north, -117.2259 + east
+
+
+def driving_track(speeds_mph, scatter_m: float = 7.0):
+    """The same receiver, on a car travelling north at the given speeds."""
+    step = scatter_m / METERS_PER_DEGREE_LAT
+    offsets = [(0.0, 0.0), (step, -step * 0.6), (-step * 0.7, step * 0.8),
+               (step * 0.5, step), (-step, -step * 0.4)]
+    latitude = 33.1696
+    for tick, mph in enumerate(speeds_mph):
+        latitude += (mph * 0.44704) / METERS_PER_DEGREE_LAT
+        north, east = offsets[tick % len(offsets)]
+        yield float(tick), latitude + north, -117.2259 + east
+
+
+def classify(track) -> list[str]:
+    gate = gps.MotionGate()
+    return [gate.update(lat, lon, now) for now, lat, lon in track]
+
+
+def test_a_stationary_receiver_is_never_driving():
+    # The whole bug, in one assertion. The shipped speed threshold called this
+    # 'D' 96% of the time and fabricated 23.6 miles a day from a desk.
+    verdicts = classify(stationary_track(600))
+    assert "D" not in verdicts, f"{verdicts.count('D')} of {len(verdicts)} samples read as driving"
+
+
+def test_a_parking_lot_crawl_still_registers_as_driving():
+    # The failure mode a naive threshold-bump would introduce. 5mph is slower
+    # than a brisk cyclist and it must still count, because stop-and-go is
+    # exactly when you want to know who is behind you.
+    verdicts = classify(driving_track([5.0] * 200))
+    assert "D" in verdicts, "a 5mph drive never registered"
+    assert verdicts.index("D") < 40, f"took {verdicts.index('D')}s to notice a 5mph drive"
+
+
+def test_detection_gets_faster_as_the_car_goes_faster():
+    # Latency is the time taken to cover GPS_MOTION_ENTER_METERS, so this
+    # ordering is a property of the design, not a coincidence to be tuned.
+    crawl = classify(driving_track([5.0] * 120)).index("D")
+    town = classify(driving_track([25.0] * 120)).index("D")
+    highway = classify(driving_track([65.0] * 120)).index("D")
+    assert highway < town < crawl, (highway, town, crawl)
+    assert highway <= 6, f"highway driving took {highway}s to detect"
+
+
+def test_a_long_red_light_does_not_flip_the_car_to_parked():
+    # Without the exit hysteresis every light drops the write cadence from
+    # GPS_MOVING_SAMPLE_SECONDS to GPS_PARKED_SAMPLE_SECONDS, and the track
+    # goes sparse in traffic - where it is worth the most.
+    verdicts = classify(driving_track(([20.0] * 30 + [0.0] * 70) * 3))
+    assert "D" in verdicts
+    after_first = verdicts[verdicts.index("D"):]
+    assert "P" not in after_first, "flipped to parked while stopped mid-drive"
+
+
+def test_a_car_parked_for_good_does_eventually_read_as_parked():
+    # The other side of that hysteresis: it must not latch on forever, or a
+    # parked car keeps writing at the moving cadence all night.
+    verdicts = classify(driving_track([20.0] * 30 + [0.0] * 400))
+    assert verdicts[-1] == "P", "never returned to parked after the drive ended"
+
+
+def test_a_replug_does_not_invent_a_drive():
+    # A receiver that vanishes and comes back somewhere else would otherwise
+    # show one enormous displacement and open a journey that never happened.
+    gate = gps.MotionGate()
+    for now, lat, lon in stationary_track(120):
+        gate.update(lat, lon, now)
+    gate.reset()
+    # Comes back 3km away, as if the car were driven while the port was down.
+    verdicts = [gate.update(33.1696 + 0.027, -117.2259, 200.0 + tick)
+                for tick in range(10)]
+    assert "D" not in verdicts, "a replug opened a drive"
+
+
+def test_the_gate_says_parked_until_it_has_enough_samples():
+    # A false 'P' loses a few seconds off the front of a drive. A false 'D'
+    # invents a journey, and distinct_drives is what correlate.py leans on.
+    gate = gps.MotionGate()
+    assert gate.update(33.1696, -117.2259, 0.0) == "P"
+    assert gate.update(33.2000, -117.2259, 1.0) == "P", "opened a drive on two samples"
+
+
+def test_the_verdict_beats_the_fixs_own_speed_reading():
+    # poll_record_from_fix must write what the gate concluded, not what one
+    # noisy sample happened to report.
+    fix = gps.Fix(valid=True, lat=33.1696, lon=-117.2259, speed_mph=2.5)
+    assert fix.status == "D", "fixture no longer exercises the disagreement"
+    assert gps.poll_record_from_fix(fix, status="P")["status"] == "P"
+    assert gps.poll_record_from_fix(fix)["status"] == "D"
+
+
+def test_path_ratio_is_reported_but_never_decides():
+    # Kept for the /gps page. It is not a decision variable: over a window
+    # short enough to be useful it reads as low as 1.4 while stationary, which
+    # is inside the range real driving occupies.
+    gate = gps.MotionGate()
+    assert gate.path_ratio is None, "claimed a ratio with no displacement"
+    for now, lat, lon in stationary_track(120):
+        gate.update(lat, lon, now)
+    snapshot = gate.snapshot()
+    assert snapshot["driving"] is False
+    assert snapshot["displacement_m"] < gate.enter_meters
+
+
+def test_the_heartbeat_carries_the_motion_block():
+    # /gps renders this. A missing key is a blank field on the page someone
+    # opens precisely when nothing else is working.
+    payload = gps._heartbeat_payload()
+    assert "motion" in payload, sorted(payload)
+    for key in ("driving", "samples", "displacement_m", "path_ratio", "enter_m"):
+        assert key in payload["motion"], sorted(payload["motion"])
 
 
 # ---------------------------------------------------------------------------

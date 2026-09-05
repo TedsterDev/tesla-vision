@@ -2136,7 +2136,7 @@ def _gps_verdict(gps_state: dict[str, Any]) -> dict[str, str]:
 
 def _gps_signal_layers(gps_state: dict[str, Any]) -> list[dict[str, str]]:
     """
-    The five-layer signal table: service, device, port, NMEA, fix.
+    The six-layer signal table: service, device, port, NMEA, fix, motion.
 
     Each layer carries its OWN age rather than one page-level age, because the
     values genuinely come from different moments. A void RMC resets lat/lon and
@@ -2158,11 +2158,11 @@ def _gps_signal_layers(gps_state: dict[str, Any]) -> list[dict[str, str]]:
         return f"{_relative_age(max(0, server_ts - moment))} ago · {_format_clock(moment)}"
 
     if gps_state.get("exists") is False or gps_state.get("error"):
-        # All five layers unknown rather than absent: an empty table reads as
+        # All six layers unknown rather than absent: an empty table reads as
         # "everything is fine and quiet", which is the opposite of the truth.
         reason = str(gps_state.get("error") or "no heartbeat has ever been written")
         return [{"name": name, "value": unknown, "age": reason}
-                for name in ("service", "device", "port", "NMEA", "fix")]
+                for name in ("service", "device", "port", "NMEA", "fix", "motion")]
 
     device = str(heartbeat.get("device") or "?")
     device_present = heartbeat.get("device_present")
@@ -2210,7 +2210,50 @@ def _gps_signal_layers(gps_state: dict[str, Any]) -> list[dict[str, str]]:
                       + f" · {fix_type_names.get(gsa_fix_type, gsa_fix_type if gsa_fix_type is not None else unknown)}"),
             "age": age_text(heartbeat.get("last_fix_at")),
         },
+        # The layer above the fix, and the only one that is about a SEQUENCE of
+        # them. A single fix cannot distinguish a car at 2mph from a stationary
+        # receiver's noise - both report a speed - so this row shows the
+        # quantity that actually decides it and the threshold it is measured
+        # against. Reading "driving: no · 13.9m of 50m" answers "why is there
+        # no drive in the log" without anyone opening the database.
+        _gps_motion_layer(heartbeat.get("motion"), unknown),
     ]
+
+
+def _gps_motion_layer(motion: Any, unknown: str) -> dict[str, str]:
+    """
+    Render the motion gate's own view of itself.
+
+    Split out because it is the one layer whose absence is expected: a
+    heartbeat written by a gps.py older than the gate has no `motion` key, and
+    an older page reading a newer heartbeat simply ignores it. Neither should
+    raise, and neither should silently render as "not moving".
+    """
+    if not isinstance(motion, dict):
+        return {
+            "name": "motion",
+            "value": unknown,
+            "age": "this heartbeat predates the motion gate",
+        }
+
+    driving = motion.get("driving")
+    displacement = motion.get("displacement_m")
+    enter = motion.get("enter_m")
+    samples = motion.get("samples")
+    ratio = motion.get("path_ratio")
+
+    measured = (f"{displacement}m of {enter}m needed"
+                if displacement is not None and enter is not None else unknown)
+    # The ratio is diagnostic only - it is shown because a large one is the
+    # signature of a stationary receiver wandering, which is exactly the
+    # question someone staring at an empty drive log is asking.
+    wander = f" · wander {ratio}x" if ratio else ""
+
+    return {
+        "name": "motion",
+        "value": f"driving: {'yes' if driving else 'no'} · {measured}{wander}",
+        "age": f"over the last {samples} fixes" if samples else "no fixes in the window",
+    }
 
 
 def _gps_page_state() -> dict[str, Any]:
