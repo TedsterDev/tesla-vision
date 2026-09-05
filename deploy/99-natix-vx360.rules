@@ -1,0 +1,22 @@
+# 99-natix-vx360.rules - wake the mirror the moment the stick is plugged in.
+#
+# Without this the worker still finds the device, but only on its next poll,
+# which is up to NATIX_POLL_SECONDS away. Restarting on hotplug makes plugging
+# the stick in feel instant, and - more usefully - makes *unplugging* it
+# trigger a clean unmount rather than leaving a stale mountpoint behind.
+#
+# Matching is deliberately loose. The VX360 reports the stock Linux gadget ids
+# (0525:a4a5), which are not unique, so this rule only *nudges* the worker;
+# src/natix.py still decides whether a given volume is really the stick, using
+# the volume UUID and label. A false trigger costs one wasted poll.
+
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_FS_LABEL}=="VX360", \
+    TAG+="systemd", ENV{SYSTEMD_WANTS}="natix-mirror.service", \
+    RUN+="/bin/systemctl --no-block restart natix-mirror.service"
+
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{ID_VENDOR_ID}=="0525", \
+    ENV{ID_MODEL_ID}=="a4a5", ENV{DEVTYPE}=="partition", \
+    RUN+="/bin/systemctl --no-block restart natix-mirror.service"
+
+ACTION=="remove", SUBSYSTEM=="block", ENV{ID_FS_LABEL}=="VX360", \
+    RUN+="/bin/systemctl --no-block restart natix-mirror.service"
