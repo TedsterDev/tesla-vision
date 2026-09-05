@@ -84,7 +84,11 @@ from src.common import LOGS_DIR, ensure_dirs, env_float, env_int
 from src.db import connect, now_ts, upsert
 from src.geo import haversine_miles, reverse_geocode
 from src.nmea_sky import SkyView
-from src.poller import MOVING_SPEED_THRESHOLD_MPH, attach_drive
+from src.poller import (
+    DRIVE_IDLE_TIMEOUT_SECONDS,
+    MOVING_SPEED_THRESHOLD_MPH,
+    attach_drive,
+)
 
 # The by-id path is derived from the device's own USB descriptor and survives
 # replugging and reboots. /dev/ttyACM0 is assigned in enumeration order, so it
@@ -357,6 +361,23 @@ class MotionGate:
     believe HDOP > 4 would go silent in exactly the urban canyon where the
     question matters, and bad geometry inflates the scatter it is already
     measuring - it is not a separate failure to guard against.
+
+    KNOWN LIMIT, and it is a limit of the sensor rather than of this code.
+    Below roughly 0.12 mph average, creeping traffic is not distinguishable
+    from a parked car by position alone: 0.10 mph covers 13m in 300 seconds
+    while this receiver's own noise covers 14-25m over the same span, so the
+    signal is smaller than the thing it has to be told apart from. Measured
+    end-to-end, a 25-minute jam advancing 6m every 90s (0.15 mph) stays one
+    drive; the same jam advancing 4m (0.10 mph) becomes two.
+
+    The consequence is bounded, and worth knowing precisely. A split journey
+    does not fabricate anything - both halves are real - but it costs
+    detect_active_tail its evidence, because that needs
+    TAIL_MIN_ENCOUNTERS_IN_DRIVE sightings inside ONE drive. Anyone widening
+    this should widen DRIVE_IDLE_TIMEOUT_SECONDS, which decides how long a
+    drive survives without movement, rather than lowering the thresholds here
+    - the gate is already at the noise floor, and a lower threshold buys
+    nothing but phantom drives.
     """
 
     def __init__(
@@ -1062,6 +1083,10 @@ def main() -> int:
     _beat(force=True)
 
     last_written_at = 0.0
+    # Far enough back that a service starting next to a parked car is not
+    # treated as being mid-drive. time.monotonic() starts near zero on this
+    # kernel, so a plain 0.0 would read as "moving a moment ago".
+    last_moving_at = -float(DRIVE_IDLE_TIMEOUT_SECONDS) * 2
     last_geocode_point: tuple[float, float] | None = None
     last_unfixed_report_at = 0.0
     previous_fix_status: str | None = None
@@ -1127,9 +1152,29 @@ def main() -> int:
                 # iteration and a lookup here would be thrown away.
                 geocode_on_park = True
             previous_fix_status = motion_status
+            if motion_status == "D":
+                last_moving_at = now
+
+            # The cadence follows the DRIVE, not the current sample.
+            #
+            # Keyed on motion_status alone, the row density collapsed from 5s
+            # to 300s the moment the gate went quiet - and the case where it
+            # goes quiet while the car is genuinely still moving is a traffic
+            # jam, where a tail is at its most observable. Detections landing
+            # in that gap get stamped by location_at() against a poll up to
+            # 150s stale, which at 30mph is a mile of error on the position the
+            # correlation engine reasons over.
+            #
+            # DRIVE_IDLE_TIMEOUT_SECONDS is deliberately the same constant
+            # attach_drive uses to decide the drive is over: for exactly as
+            # long as a drive can still be alive, this keeps writing at the
+            # resolution that drive deserves. It costs one extra row every 5s
+            # for 5 minutes at the end of each journey.
+            in_live_drive = (now - last_moving_at) < DRIVE_IDLE_TIMEOUT_SECONDS
 
             interval = (
-                GPS_MOVING_SAMPLE_SECONDS if motion_status == "D"
+                GPS_MOVING_SAMPLE_SECONDS
+                if (motion_status == "D" or in_live_drive)
                 else GPS_PARKED_SAMPLE_SECONDS
             )
             if now - last_written_at < interval:

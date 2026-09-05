@@ -64,7 +64,17 @@ ASLEEP_POLL_SECONDS = env_int("ASLEEP_POLL_SECONDS", 900)
 DRIVE_IDLE_TIMEOUT_SECONDS = env_int("DRIVE_IDLE_TIMEOUT_SECONDS", 300)
 
 # Below this speed we treat the car as stationary regardless of shift state.
+#
+# Applies to the Fleet API path, where a parked car reports speed = None and
+# this threshold only has to clear zero. It is NOT what classifies a GNSS
+# receiver - see MotionGate in gps.py, which decides from displacement because
+# a stationary receiver reports 0.5-3.5 mph of noise indefinitely and this
+# threshold called it driving 96% of the time.
 MOVING_SPEED_THRESHOLD_MPH = env_float("MOVING_SPEED_THRESHOLD_MPH", 1.0)
+
+# A closed drive whose furthest point is nearer than this to where it started
+# never went anywhere, and is deleted. 250 feet.
+DRIVE_MIN_DISPLACEMENT_MILES = env_float("DRIVE_MIN_DISPLACEMENT_MILES", 0.047)
 
 
 class TeslaFleetClient:
@@ -238,14 +248,86 @@ def poll_record_from_vehicle_data(data: dict) -> dict:
     }
 
 
+def discard_drive_that_went_nowhere(connection, drive_id: str) -> bool:
+    """
+    Delete a just-closed drive that never left where it started. True if it did.
+
+    This replaces a guard that read `if seconds_since_start < 60` and was
+    unreachable. Reaching it required a gap of at least
+    DRIVE_IDLE_TIMEOUT_SECONDS (300s) since the anchoring poll, and since that
+    poll belongs to this drive, seconds_since_start was necessarily >= 300 too.
+    The `< 60` test could never be true, so the comment's promise - that noise
+    drives "can't inflate anyone's distinct drives count" - was never kept.
+
+    Duration was the wrong measure anyway. A drive that lasted ten minutes in a
+    parking space is exactly the thing worth discarding, and a legitimate
+    30-second hop to the end of the street is not. Displacement says which is
+    which: a real journey ends somewhere else, or at least passes somewhere
+    else on the way.
+
+    The polls are RELINKED, not deleted, and that ordering is the whole
+    subtlety. A poll remains a true record that the car was at that place at
+    that time, and location_at() reads polls - not drives - to stamp clips.
+    Deleting the drives row while leaving polls.drive_id pointing at it would
+    leave every detection stamped with a drive that no longer exists, so
+    correlate.py would keep counting it in distinct_drives (it reads the
+    detection's own column, never joining back to drives) while the operator's
+    view of that journey was gone. That is strictly worse than leaving it.
+    """
+    points = [
+        (row["lat"], row["lon"])
+        for row in connection.execute(
+            "SELECT lat, lon FROM polls WHERE drive_id=? AND lat IS NOT NULL "
+            "ORDER BY ts",
+            (drive_id,),
+        )
+    ]
+
+    if len(points) >= 2:
+        start_lat, start_lon = points[0]
+        displacement = max(
+            haversine_miles(start_lat, start_lon, lat, lon)
+            for lat, lon in points[1:]
+        )
+        if displacement >= DRIVE_MIN_DISPLACEMENT_MILES:
+            return False
+    elif len(points) == 1:
+        # One located poll is not evidence of a journey.
+        pass
+    else:
+        # No located polls at all - nothing could have been observed on it.
+        pass
+
+    connection.execute(
+        "UPDATE polls SET drive_id=NULL WHERE drive_id=?", (drive_id,)
+    )
+    connection.execute("DELETE FROM drives WHERE id=?", (drive_id,))
+    return True
+
+
 def attach_drive(connection, poll: dict) -> str | None:
     """
     Assign this poll to a drive, opening or closing one as needed.
 
-    A drive opens on the first moving poll and closes once the car has been
-    stationary for DRIVE_IDLE_TIMEOUT_SECONDS. Grouping by drive is what lets
-    the correlation engine say "on four separate journeys" rather than "four
+    A drive opens on the first moving poll and closes once the car has not
+    MOVED for DRIVE_IDLE_TIMEOUT_SECONDS. Grouping by drive is what lets the
+    correlation engine say "on four separate journeys" rather than "four
     times", which is a far stronger statement.
+
+    "Not moved for", not "no poll for". Those read alike and are not alike, and
+    the difference silently disabled the whole mechanism once a GNSS receiver
+    became the source. The old test measured the gap to the last poll of ANY
+    status, but a parked poll is still attached to the open drive and so
+    becomes that last poll - meaning the gap could only grow while nothing was
+    being written at all. It happened to work against the Fleet API, where a
+    parked car is polled every PARKED_POLL_SECONDS and the write cadence alone
+    produced the gap. Against a receiver reporting continuously it made the
+    close branch unreachable: one drive stayed open forever and absorbed every
+    poll, which pins distinct_drives at 1 - zeroing the 45-point signal
+    correlate.py calls its strongest - and makes detect_active_tail's "within a
+    single journey" test vacuous, so three sightings days apart score 75.0 and
+    fire an urgent push. Anchoring on the last MOVING poll makes the condition
+    mean what its name says.
     """
     open_drive = connection.execute(
         "SELECT * FROM drives WHERE is_open=1 ORDER BY start_ts DESC LIMIT 1"
@@ -254,17 +336,31 @@ def attach_drive(connection, poll: dict) -> str | None:
     is_moving = poll["status"] == "D"
 
     if open_drive:
-        seconds_since_start = poll["ts"] - open_drive["start_ts"]
+        last_moving = connection.execute(
+            "SELECT ts FROM polls WHERE drive_id=? AND status='D' "
+            "ORDER BY ts DESC LIMIT 1",
+            (open_drive["id"],),
+        ).fetchone()
+        last_moving_ts = last_moving["ts"] if last_moving else open_drive["start_ts"]
         last_poll = connection.execute(
             "SELECT ts, lat, lon FROM polls WHERE drive_id=? ORDER BY ts DESC LIMIT 1",
             (open_drive["id"],),
         ).fetchone()
-        last_ts = last_poll["ts"] if last_poll else open_drive["start_ts"]
 
-        if is_moving or (poll["ts"] - last_ts) < DRIVE_IDLE_TIMEOUT_SECONDS:
+        if is_moving or (poll["ts"] - last_moving_ts) < DRIVE_IDLE_TIMEOUT_SECONDS:
             # Still the same journey - extend it.
+            #
+            # Distance accrues only on MOVING polls. This is a path length, so
+            # summing consecutive steps is right for a car - an odometer
+            # measures the road, not the straight line home. It is wrong for a
+            # stationary receiver, whose jitter has no net direction but plenty
+            # of length: measured on this hardware, 86.2m of summed steps
+            # against 5.5m of actual displacement, which accrued 23.6 phantom
+            # miles a day. Gating on is_moving keeps the odometer semantics for
+            # the case they suit and contributes zero for the case they do not.
             distance_added = 0.0
-            if last_poll and last_poll["lat"] is not None and poll["lat"] is not None:
+            if (is_moving and last_poll
+                    and last_poll["lat"] is not None and poll["lat"] is not None):
                 distance_added = haversine_miles(
                     last_poll["lat"], last_poll["lon"], poll["lat"], poll["lon"]
                 )
@@ -278,10 +374,7 @@ def attach_drive(connection, poll: dict) -> str | None:
 
         # Idle too long - close it out.
         connection.execute("UPDATE drives SET is_open=0 WHERE id=?", (open_drive["id"],))
-        if seconds_since_start < 60:
-            # A drive that never really started is noise; drop it so it can't
-            # inflate anyone's "distinct drives" count.
-            connection.execute("DELETE FROM drives WHERE id=?", (open_drive["id"],))
+        discard_drive_that_went_nowhere(connection, open_drive["id"])
 
     if not is_moving:
         return None
