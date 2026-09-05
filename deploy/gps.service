@@ -1,0 +1,72 @@
+[Unit]
+Description=GNSS location poller - stamps detections with position and drive
+Documentation=file:/home/tedster/projects/tesla-alerts/README.md
+After=local-fs.target
+Wants=local-fs.target
+
+# NOT RequiresMountsFor=/mnt/jetsondata, and that is deliberate. Verified on
+# this machine: /mnt/jetsondata is declared in fstab with `nofail` but is not
+# currently a mountpoint - `findmnt -T /mnt/jetsondata/tesla-alerts` resolves to
+# / on /dev/mmcblk0p1, so scout.db, the clip archive and the heartbeat all live
+# on the SD card in a plain directory sitting where the volume should be. Adding
+# the directive today would make systemd refuse to start this unit at all.
+#
+# The hazard it would have covered is real and is recorded here instead: the day
+# that volume does mount, docker resolves bind mounts at container CREATE time,
+# so the running web container keeps reading the OLD directory while a freshly
+# started gps.service writes into the NEW one. Reader and writer end up on two
+# different filesystems with no error on either side, and /gps shows a heartbeat
+# that is permanently stale for a service that is perfectly healthy.
+#
+# So: after any change to that mount, add RequiresMountsFor=/mnt/jetsondata
+# here, recreate the containers (`docker compose up -d --force-recreate`), and
+# confirm both sides agree with
+#   findmnt -T /mnt/jetsondata/tesla-alerts
+#   docker compose exec web sh -c 'stat -c %d /data/logs'
+
+[Service]
+Type=simple
+# Root for two reasons, both the same ones natix-mirror carries:
+#   - /dev/ttyACM0 is root:dialout, and this must survive a replug that lands
+#     the receiver on a different node
+#   - scout.db is written by root-owned containers, so a non-root writer would
+#     be locked out of the database it exists to write
+User=root
+WorkingDirectory=/home/tedster/projects/tesla-alerts
+EnvironmentFile=-/home/tedster/projects/tesla-alerts/.env
+Environment=PYTHONPATH=/home/tedster/projects/tesla-alerts
+Environment=BASE_DIR=/mnt/jetsondata/tesla-alerts
+ExecStart=/usr/bin/python3 -u /home/tedster/projects/tesla-alerts/src/gps.py
+
+# Deliberately NOT a docker-compose service, unlike poller.
+#
+# Compose resolves `devices:` when the container is created. A USB brown-out -
+# which is what cranking the engine looks like to a hub - re-enumerates the
+# receiver, and the container is then holding a device node that no longer
+# refers to anything. It cannot recover without being recreated, so the failure
+# mode is "logs one drive, then nothing for a month" with the container still
+# showing as healthy.
+#
+# src/gps.py reopens the /dev/serial/by-id path instead, which udev recreates
+# on replug, so a host unit rides out exactly the event that breaks the
+# container. gps.py is stdlib-only, so it needs no image to do it.
+
+Restart=always
+RestartSec=10
+
+# This one CAN be sandboxed, unlike natix-mirror: it mounts nothing, so none of
+# the mount-namespace options apply. It needs /dev/serial and the database.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/mnt/jetsondata/tesla-alerts
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target
