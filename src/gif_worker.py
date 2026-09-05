@@ -14,16 +14,27 @@ from pathlib import Path
 
 from src.common import (
     ensure_dirs,
+    env_int,
     GIF_QUEUE_DIR,
     MEDIA_DIR,
     PROCESSED_DIR,
     ALERTS_DIR,
 )
+from src.db import connect
 
 # GIF Generation Config (Scaled for dashboard)
-GIF_SECONDS = 5
-FPS = 10            # Set Frames per Second (Lower == Smaller GIF)
-SCALE_WIDTH = 640
+#
+# These are preview thumbnails for a dashboard that has to load over a phone
+# hotspot, not archival footage - the source MP4 is still on disk if you need
+# detail. At the original 640px/10fps a five-second clip came out at 6.8-10 MB
+# each, and the Recent view renders many alerts at once, so a single page load
+# pulled close to a gigabyte. 480px at 8fps is roughly a third of that and
+# still perfectly legible for "what happened here".
+#
+# Raise them if you want richer previews and have the bandwidth.
+GIF_SECONDS = env_int("GIF_SECONDS", 5)
+FPS = env_int("GIF_FPS", 8)              # Set Frames per Second (Lower == Smaller GIF)
+SCALE_WIDTH = env_int("GIF_SCALE_WIDTH", 480)
 
 def load_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
@@ -47,10 +58,32 @@ def make_gif_ffmpeg(video_path: Path, out_gif: Path) -> None:
     """
     Create GIFs using ffmpeg.
     - Writes to a temp file then renames (atomic within the same filesystem).
-    """
-    temporary_out_file = out_gif.with_suffix(".gif.tmp")
 
-    video_filter = f"fps={FPS},scale={SCALE_WIDTH}:-1:flags=lanczos" # lanczos is a high scaling scaling algorithm
+    Two things here are load-bearing and were not obvious:
+
+    `-f gif` is REQUIRED. ffmpeg picks its output format from the filename
+    extension, and we deliberately write to a temporary name so a crash can
+    never leave a half-written GIF in the media directory. That temporary name
+    ends in `.tmp`, which ffmpeg cannot map to any format - it fails with
+    "Unable to choose an output format" and exit status 234. Stating the format
+    explicitly decouples the two concerns.
+
+    The palette filtergraph is what makes the output legible. A GIF holds 256
+    colours; without a palette pass ffmpeg quantises against a fixed web
+    palette, which turns night footage into mud. `palettegen` derives an
+    optimal palette from these actual frames and `paletteuse` maps to it, in a
+    single pass via `split`. That difference matters a lot here, because the
+    whole point of the GIF is to let a human look at an alert and tell what
+    happened.
+    """
+    temporary_out_file = out_gif.with_name(out_gif.name + ".tmp")
+
+    # lanczos is a high quality scaling algorithm; split/palettegen/paletteuse
+    # builds a per-clip 256-colour palette instead of using the default one.
+    video_filter = (
+        f"fps={FPS},scale={SCALE_WIDTH}:-1:flags=lanczos,"
+        f"split[s0][s1];[s0]palettegen=stats_mode=diff[p];[s1][p]paletteuse=dither=bayer"
+    )
 
     cmd = [
         "ffmpeg",
@@ -60,7 +93,8 @@ def make_gif_ffmpeg(video_path: Path, out_gif: Path) -> None:
         "-ss", "0",             # 0 seek to time 0
         "-t", str(GIF_SECONDS), # GIF_SECONDS only process that many seconds
         "-i", str(video_path),  # -i video_path input file.
-        "-vf", video_filter,
+        "-filter_complex", video_filter,
+        "-f", "gif",            # state the format; the temp name cannot imply it
         str(temporary_out_file) # output file
     ]
 
@@ -72,21 +106,38 @@ def make_gif_ffmpeg(video_path: Path, out_gif: Path) -> None:
 def save_json(path: Path, obj: dict) -> None:
     path.write_text(json.dumps(obj, indent=2), encoding="utf-8")
 
-def update_alert_status(alert_id: str, status: str, **updates) -> None:
+def update_alert_status(alert_id: str, status: str, connection=None, **updates) -> None:
     """
-    Updates an existing alert JSON with a new status and any other additional fields.
+    Update an alert's status in BOTH places it is recorded.
+
+    The JSON file is the on-disk record the dashboard's Recent view reads; the
+    `alerts` table backs the JSON API and the stats counters. Writing only the
+    file (as this did before the database existed) left the table permanently
+    claiming every alert was still 'gif_queued'.
     """
     alert_path = ALERTS_DIR / f"{alert_id}.json"
-    if not alert_path.exists():
+    if alert_path.exists():
+        alert = load_json(alert_path)
+        alert["status"] = status
+        alert.update(updates)
+        save_json(alert_path, alert)
+
+    if connection is None:
         return
 
-    alert = load_json(alert_path)
-    alert["status"] = status
-    alert.update(updates)
-    save_json(alert_path, alert)
+    try:
+        connection.execute(
+            "UPDATE alerts SET status=?, gif=COALESCE(?, gif) WHERE id=?",
+            (status, updates.get("gif"), alert_id),
+        )
+        connection.commit()
+    except Exception as exception_object:
+        # A database hiccup must never lose the GIF we just successfully made.
+        print(f"[🎞️ gif_worker] could not update alert row {alert_id}: {exception_object}")
 
 def main():
     ensure_dirs()
+    connection = connect()
 
     print(f"[🎞️ gif_worker] queue={GIF_QUEUE_DIR} media={MEDIA_DIR}")
 
@@ -105,7 +156,7 @@ def main():
         job_file = jobs[0]
 
         # Atomically claim the job by renaming it (prevents double-processing if worker restarts)
-        claimed = job_file.with_suffix(".json.processing")
+        claimed = job_file.with_name(job_file.name + ".processing")
         try:
             job_file.replace(claimed)
         except FileNotFoundError:
@@ -137,10 +188,10 @@ def main():
             print(f"[🎞️ gif_worker] making gif alert={alert_id} video={video_path.name}")
             make_gif_ffmpeg(video_path, out_gif)
 
-            update_alert_status(alert_id, status="gif_done", gif=out_gif.name)
+            update_alert_status(alert_id, status="gif_done", connection=connection, gif=out_gif.name)
 
             # Mark job as done
-            done = claimed.with_suffix(".json.done")
+            done = job_file.with_name(job_file.name + ".done")
             claimed.replace(done)
 
             print(f"[🎞️ gif_worker] done alert={alert_id} gif={out_gif.name}")
@@ -148,9 +199,9 @@ def main():
         except Exception as exception_object:
             print(f"[🎞️ gif_worker] FAILED {claimed.name}: {exception_object}")
             if alert_id:
-                update_alert_status(alert_id, status="gif_failed")            
+                update_alert_status(alert_id, status="gif_failed", connection=connection)            
 
-            failed = claimed.with_suffix(".json.failed")
+            failed = job_file.with_name(job_file.name + ".failed")
             try:
                 claimed.replace(failed)
             except Exception:

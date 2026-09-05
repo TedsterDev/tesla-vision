@@ -37,12 +37,55 @@ JOBS_DIR = BASE_DIR / "jobs"            # job-related files
 GIF_QUEUE_DIR = JOBS_DIR / "gif_queue"  # JSON job files for GIF worker
 LOGS_DIR = BASE_DIR / "logs"            # optional log files
 
+# --- Scout port additions ---------------------------------------------------
+# Cropped evidence lives *inside* MEDIA_DIR because the web app mounts that
+# directory at /media, so anything we drop here is instantly viewable.
+PLATE_CROPS_DIR = MEDIA_DIR / "plates"  # cropped license plate JPEGs
+FACE_CROPS_DIR = MEDIA_DIR / "faces"    # cropped face JPEGs
+
+# The single SQLite file holding every table (see db.py).
+DB_PATH = env_path("DB_PATH", str(BASE_DIR / "scout.db"))
+
+# Where downloadable model weights live (YuNet, SFace, plate detector).
+# scripts/fetch_models.sh populates this; modules degrade gracefully if empty.
+MODELS_DIR = env_path("MODELS_DIR", str(BASE_DIR / "models"))
+
+def env_flag(name: str, default: bool = False) -> bool:
+    """
+    Read an env var as a boolean. Accepts 1/true/yes/on (case-insensitive).
+
+    Used for the ENABLE_* switches so each stage of the pipeline can be turned
+    off independently - handy on the Orin Nano where we may not want to pay for
+    face embedding on every clip.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+def env_float(name: str, default: float) -> float:
+    """Read an env var as a float, falling back to `default` on anything odd."""
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+def env_int(name: str, default: int) -> int:
+    """Read an env var as an int, falling back to `default` on anything odd."""
+    try:
+        return int(float(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
 def ensure_dirs():
     """
     Create all required directories if they don't exist.
     Safe to call repeatedly
     """
-    for path in [INBOX_DIR, PROCESSED_DIR, ALERTS_DIR, MEDIA_DIR, JOBS_DIR, GIF_QUEUE_DIR, LOGS_DIR]:
+    for path in [
+        INBOX_DIR, PROCESSED_DIR, ALERTS_DIR, MEDIA_DIR, JOBS_DIR, GIF_QUEUE_DIR,
+        LOGS_DIR, PLATE_CROPS_DIR, FACE_CROPS_DIR, MODELS_DIR,
+    ]:
         path.mkdir(parents=True, exist_ok=True)
 
 def file_is_stable(
