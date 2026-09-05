@@ -6,6 +6,7 @@ services:
     command: ["python", "-u", "src/processor.py"]
     volumes:
       - /mnt/jetsondata/tesla-alerts:/data
+    env_file: .env
     environment:
       - PYTHONPATH=/app
       - BASE_DIR=/data
@@ -13,6 +14,9 @@ services:
       # We'll populate /data/inbox via a host-side ingest script later.
       - TESLACAM_DIR=/data/teslacam_stub/TeslaCam
       - YOLO_CONFIG_DIR=/data/.config
+      # Model weights for the ALPR and face stages; ./scripts/fetch_models.sh
+      # downloads them into this directory on the host.
+      - MODELS_DIR=/data/models
     restart: unless-stopped
 
   gif_worker:
@@ -22,6 +26,25 @@ services:
     command: ["python", "-u", "src/gif_worker.py"]
     volumes:
       - /mnt/jetsondata/tesla-alerts:/data
+    # gif_worker reads GIF_SECONDS / GIF_FPS / GIF_SCALE_WIDTH, so it needs .env
+    # like every other service. Without this those knobs are silently inert.
+    env_file: .env
+    environment:
+      - PYTHONPATH=/app
+      - BASE_DIR=/data
+    restart: unless-stopped
+
+  # Vehicle telemetry: the port of Scout's TeslaJS poll.js. Without Tesla API
+  # credentials in .env this exits immediately with an explanation, which is a
+  # supported way to run - detections just won't carry GPS context.
+  poller:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    command: ["python", "-u", "src/poller.py"]
+    volumes:
+      - /mnt/jetsondata/tesla-alerts:/data
+    env_file: .env
     environment:
       - PYTHONPATH=/app
       - BASE_DIR=/data
@@ -40,4 +63,9 @@ services:
     environment:
       - BASE_DIR=/data
       - PYTHONPATH=/app
+      - MODELS_DIR=/data/models
+      # The Settings page constructs a PlateReader, which loads ultralytics.
+      # Without this it writes its config into the container's ephemeral HOME
+      # instead of sharing the processor's, and loses it on every recreate.
+      - YOLO_CONFIG_DIR=/data/.config
     restart: unless-stopped
