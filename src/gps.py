@@ -183,6 +183,34 @@ GPS_MOTION_EXIT_HOLD_SECONDS = env_int("GPS_MOTION_EXIT_HOLD_SECONDS", 90)
 # 'D' invents a journey that never happened.
 GPS_MOTION_MIN_SAMPLES = env_int("GPS_MOTION_MIN_SAMPLES", 4)
 
+# A fix the receiver could not actually have solved is not fed to the gate.
+#
+# The thresholds above were calibrated against a HEALTHY receiver: 8 satellites,
+# HDOP 1.2, and a position that wandered 13m at the very worst. Measured again
+# with the antenna indoors and 0-2 satellites audible, the same unit scattered
+# to 108m - and 108m clears a 50m gate, so it opened three drives while sitting
+# on a desk. The gate was sound and the input was not.
+#
+# This is NOT the HDOP-refusal that MotionGate's docstring rejects, and the
+# distinction matters. Refusing a poor-but-real solution would go blind in an
+# urban canyon, where the question matters most. Refusing a solution computed
+# from fewer than four satellites refuses something that was never a position:
+# three pseudoranges cannot determine three spatial unknowns plus the clock
+# offset. That is arithmetic, not caution.
+#
+# The HDOP ceiling is deliberately loose. Typical values are 1-2 open sky and
+# 5-10 in a canyon, so 20 rejects only geometry so degenerate that the receiver
+# is reporting a line rather than a point. It is a backstop for a receiver that
+# claims four satellites and still cannot solve, not a quality bar.
+#
+# The polls row is still WRITTEN for such a fix. It is roughly right - well
+# inside the 240m DWELL_RADIUS_MILES that clip stamping cares about - and a
+# rough position is better than none for "where was the car". It is only the
+# drive/park decision, which compares positions tens of metres apart, that
+# cannot survive the error.
+GPS_MIN_SATELLITES_FOR_MOTION = env_int("GPS_MIN_SATELLITES_FOR_MOTION", 4)
+GPS_MAX_HDOP_FOR_MOTION = env_float("GPS_MAX_HDOP_FOR_MOTION", 20.0)
+
 
 # ---------------------------------------------------------------------------
 # NMEA parsing
@@ -463,6 +491,11 @@ class MotionGate:
         return "D" if self._driving else "P"
 
     @property
+    def verdict(self) -> str:
+        """The standing answer, without feeding a new fix."""
+        return "D" if self._driving else "P"
+
+    @property
     def path_ratio(self) -> float | None:
         """
         Summed steps over net displacement. Diagnostic only - it is on the
@@ -489,6 +522,26 @@ class MotionGate:
 def _meters(lat_a: float, lon_a: float, lat_b: float, lon_b: float) -> float:
     """Metres between two fixes. geo.py owns the haversine; this is the unit."""
     return haversine_miles(lat_a, lon_a, lat_b, lon_b) * 1609.344
+
+
+def fix_can_locate(fix: Fix) -> bool:
+    """
+    Is this fix a position, or just the receiver's best guess at one?
+
+    RMC's 'A' status is a much weaker claim than it looks: a receiver in a
+    garage with three satellites will happily mark a solution active and report
+    coordinates that move a hundred metres between epochs. Those coordinates
+    are fine for "roughly where is the car" and useless for "did it move".
+    See the constants for why satellite count is the honest test and HDOP is
+    only a backstop.
+    """
+    if not fix.valid:
+        return False
+    if fix.satellites < GPS_MIN_SATELLITES_FOR_MOTION:
+        return False
+    if fix.hdop is not None and fix.hdop > GPS_MAX_HDOP_FOR_MOTION:
+        return False
+    return True
 
 
 class NmeaAssembler:
@@ -675,6 +728,7 @@ _HEARTBEAT_ENABLED = False
 _STATE: dict = {
     "assembler": None,
     "gate": None,
+    "unlocatable_fixes": 0,
     "port_open": False,
     "last_error": None,
     "last_error_ts": None,
@@ -862,7 +916,11 @@ def _heartbeat_payload() -> dict:
         "sentences_total": _STATE["sentences_total"],
         "checksum_failures": _STATE["checksum_failures"],
         "last_sentence_ts": _STATE["last_sentence_ts"],
-        "motion": gate.snapshot(),
+        # Nested inside the motion block rather than added as a top-level key,
+        # so the heartbeat's agreed key set - which tests/test_gps.py pins and
+        # the page reads unconditionally - does not change again.
+        "motion": {**gate.snapshot(),
+                   "unlocatable_fixes": _STATE["unlocatable_fixes"]},
         "fix_valid": bool(fix.valid),
         "fix_quality": fix.quality,
         "satellites_used": fix.satellites,
@@ -1087,6 +1145,10 @@ def main() -> int:
     # treated as being mid-drive. time.monotonic() starts near zero on this
     # kernel, so a plain 0.0 would read as "moving a moment ago".
     last_moving_at = -float(DRIVE_IDLE_TIMEOUT_SECONDS) * 2
+    # Starts in the past for the same reason: a service that comes up with the
+    # receiver already indoors must not treat its first bad fix as continuing
+    # from a good one a moment ago.
+    last_locatable_at = -float(GPS_MOTION_WINDOW_SECONDS) * 2
     last_geocode_point: tuple[float, float] | None = None
     last_unfixed_report_at = 0.0
     previous_fix_status: str | None = None
@@ -1136,7 +1198,22 @@ def main() -> int:
 
             # Fed at the receiver's rate, above the write-cadence gate below,
             # so the verdict is settled before a row is ever due.
-            motion_status = gate.update(fix.lat, fix.lon, now)
+            if fix_can_locate(fix):
+                motion_status = gate.update(fix.lat, fix.lon, now)
+                last_locatable_at = now
+            else:
+                _STATE["unlocatable_fixes"] += 1
+                # Drop the window once it has gone stale, and this is the whole
+                # reason the branch exists rather than just skipping the update.
+                # A car that parks underground, sits for an hour and drives out
+                # would otherwise meet its first good fix holding a window whose
+                # newest point is from before it went in - one enormous
+                # displacement, and a drive opened for a journey that was over
+                # before the receiver could see it. Same failure as a replug,
+                # same remedy.
+                if now - last_locatable_at > gate.window_seconds:
+                    gate.reset()
+                motion_status = gate.verdict
 
             if previous_fix_status == "D" and motion_status == "P":
                 # The car has just stopped. The module docstring promises a

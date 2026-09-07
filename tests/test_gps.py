@@ -596,6 +596,46 @@ def test_path_ratio_is_reported_but_never_decides():
     assert snapshot["displacement_m"] < gate.enter_meters
 
 
+def test_a_fix_the_receiver_could_not_have_solved_is_not_fed_to_the_gate():
+    # Measured indoors on the real unit: with 0-2 satellites audible the
+    # position scattered to 108m, which clears the 50m gate and opened three
+    # drives on a desk. Three pseudoranges cannot determine three spatial
+    # unknowns plus the clock offset, so such a fix is not a noisy position -
+    # it is not a position.
+    assert gps.fix_can_locate(
+        gps.Fix(valid=True, lat=33.1696, lon=-117.2259, satellites=8, hdop=1.2))
+    assert not gps.fix_can_locate(
+        gps.Fix(valid=True, lat=33.1696, lon=-117.2259, satellites=3, hdop=1.2)), (
+        "accepted a 3-satellite solution")
+    assert not gps.fix_can_locate(
+        gps.Fix(valid=True, lat=33.1696, lon=-117.2259, satellites=9, hdop=45.0)), (
+        "accepted degenerate geometry")
+    assert not gps.fix_can_locate(
+        gps.Fix(valid=False, lat=33.1696, lon=-117.2259, satellites=9, hdop=1.0))
+
+
+def test_an_urban_canyon_fix_is_still_believed():
+    # The failure mode of over-tightening this. HDOP 5-10 is ordinary between
+    # tall buildings, and going blind there would lose the tail in exactly the
+    # place tails are followed.
+    assert gps.fix_can_locate(
+        gps.Fix(valid=True, lat=33.1696, lon=-117.2259, satellites=5, hdop=8.0))
+    # A receiver that reports no HDOP at all must not be rejected for it.
+    assert gps.fix_can_locate(
+        gps.Fix(valid=True, lat=33.1696, lon=-117.2259, satellites=6, hdop=None))
+
+
+def test_the_gate_holds_its_answer_while_fixes_are_unusable():
+    # Skipping the update must not silently flip the verdict: a car that drives
+    # into a tunnel is still driving.
+    gate = gps.MotionGate()
+    for now, lat, lon in driving_track([30.0] * 60):
+        gate.update(lat, lon, now)
+    assert gate.verdict == "D"
+    # No further updates - as when every fix stops being locatable.
+    assert gate.verdict == "D", "the verdict changed with no new information"
+
+
 def test_the_heartbeat_carries_the_motion_block():
     # /gps renders this. A missing key is a blank field on the page someone
     # opens precisely when nothing else is working.
