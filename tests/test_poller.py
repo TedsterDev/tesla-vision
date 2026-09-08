@@ -212,6 +212,31 @@ def test_the_tesla_path_still_segments_the_same_way():
     assert recorded[0]["distance_miles"] > 1.0, recorded[0]["distance_miles"]
 
 
+def test_discarding_a_drive_unlinks_clips_and_detections_too():
+    # The audit's finding #20: the first version relinked only polls, while
+    # clips and both detection tables also carry drive_id - and correlate.py
+    # counts distinct_drives from the detection's own column, so a deleted
+    # phantom would have stayed in the score forever.
+    connection = fresh_database()
+    write_poll(connection, 0, "D", north_meters=0)
+    write_poll(connection, 10, "D", north_meters=20)
+    drive_id = drives(connection)[0]["id"]
+    connection.execute(
+        "INSERT INTO clips (id, filename, ingested_ts, status, drive_id) VALUES (?,?,?,?,?)",
+        ("c1", "2026-02-16_20-49-20-back.mp4", 0, "ingested", drive_id))
+    connection.execute(
+        "INSERT INTO plate_detections (id, plate_id, plate_text, ts, drive_id) VALUES (?,?,?,?,?)",
+        ("d1", "p1", "ABC123", 5, drive_id))
+    connection.commit()
+    write_poll(connection, 400, "P", north_meters=20)          # closes and discards it
+
+    assert drives(connection) == []
+    for table in poller.DRIVE_ID_TABLES:
+        left = connection.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE drive_id=?", (drive_id,)).fetchone()[0]
+        assert left == 0, f"{table} still references the deleted drive"
+
+
 # ---------------------------------------------------------------------------
 def main() -> int:
     tests = [

@@ -20,14 +20,42 @@ Filenames look like:
     2026-02-16_21-30-21-right_pillar.mp4
     2019-04-10_16-33-38-left_repeater.mp4
 
-The timestamp is the vehicle's *local* wall clock, not UTC. We convert using
-the box's local timezone, which is correct as long as the Jetson and the car
-agree - they do, both ride in the same vehicle.
+The timestamp is the vehicle's *local* wall clock, not UTC, and it is
+converted in CLIP_TIMEZONE - NEVER in the process's own zone.
+
+That distinction was a critical bug. The first version used a naive datetime
+and .timestamp(), which interprets the value in whatever zone the process
+happens to run in, and every container runs in UTC while the car keeps
+Pacific time. Every clip was therefore stored 7-8 hours early. Not cosmetic:
+location_at() takes that timestamp to the polls table, so every detection was
+placed where the car had been hours earlier - usually parked at home - which
+zeroes the drive signal and fires the "anchored to one location" suppression
+on exactly the vehicles this system exists to notice. Confirmed against the
+live database: 2026-02-16_20-49-20-back.mp4 was stored as 20:49 UTC.
+
+The zone is a setting rather than the host's because the host is not the
+authority either - a Jetson that boots with no network may hold any zone at
+all. The car is the authority, and the car's zone is a fact the operator
+knows. If the named zone cannot be loaded this module refuses to import,
+because a wrong zone that parses successfully is the exact failure above.
 """
+import os
 import re
 
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+CLIP_TIMEZONE = os.environ.get("CLIP_TIMEZONE", "America/Los_Angeles")
+
+try:
+    CLIP_ZONE = ZoneInfo(CLIP_TIMEZONE)
+except ZoneInfoNotFoundError as error:
+    raise RuntimeError(
+        f"CLIP_TIMEZONE={CLIP_TIMEZONE!r} is not a known IANA zone. Set it to the "
+        f"car's zone (e.g. America/Los_Angeles) - a clip timestamp parsed in the "
+        f"wrong zone silently mislocates every detection."
+    ) from error
 
 # The six camera positions Tesla writes, longest-first so that a naive prefix
 # match can never shadow a longer name.
@@ -79,9 +107,9 @@ def parse_clip_filename(filename: str) -> dict:
 
     try:
         captured = datetime.strptime(f"{date_text} {time_text}", "%Y-%m-%d %H:%M:%S")
-        # .timestamp() on a naive datetime interprets it as local time, which is
-        # exactly what Tesla wrote.
-        captured_ts = int(captured.timestamp())
+        # Attach the car's zone explicitly. A naive .timestamp() here would use
+        # the process zone, which in a container is UTC - see the module doc.
+        captured_ts = int(captured.replace(tzinfo=CLIP_ZONE).timestamp())
     except ValueError:
         captured_ts = None
 

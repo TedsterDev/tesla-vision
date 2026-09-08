@@ -59,14 +59,23 @@ echo "==> systemd unit"
 sed "s|/home/tedster/projects/tesla-alerts|$REPO_ROOT|g" "$UNIT_SRC" > "$UNIT_DST"
 chmod 644 "$UNIT_DST"
 
-# Read BASE_DIR back out of the INSTALLED unit rather than from .env. systemd
-# applies EnvironmentFile= and Environment= in file order and the unit sets
-# BASE_DIR after loading .env, so the unit's value is the one that wins - and
-# it is where the heartbeat will actually land. Guessing from .env here would
-# make this script check the wrong directory and report a healthy service as
-# broken.
-SERVICE_BASE_DIR="$(sed -n 's/^Environment=BASE_DIR=//p' "$UNIT_DST" | tail -1)"
-SERVICE_BASE_DIR="${SERVICE_BASE_DIR:-/mnt/jetsondata/tesla-alerts}"
+# Compute BASE_DIR the way systemd will. The previous comment here claimed the
+# unit's Environment= line wins because it comes after EnvironmentFile=; that
+# is backwards. systemd applies EnvironmentFile= AFTER every Environment=
+# regardless of order (systemd.exec(5): "Settings from these files override
+# settings made with Environment="), verified on this host's systemd 249. So a
+# BASE_DIR line in .env silently wins, and this script must look there first
+# or it will check the wrong directory and report a healthy service as broken.
+BASE_DIR_FROM_ENV=""
+if [[ -f "$REPO_ROOT/.env" ]]; then
+  BASE_DIR_FROM_ENV="$(sed -n 's/^BASE_DIR=//p' "$REPO_ROOT/.env" | tail -1)"
+fi
+BASE_DIR_FROM_UNIT="$(sed -n 's/^Environment=BASE_DIR=//p' "$UNIT_DST" | tail -1)"
+SERVICE_BASE_DIR="${BASE_DIR_FROM_ENV:-${BASE_DIR_FROM_UNIT:-/mnt/jetsondata/tesla-alerts}}"
+if [[ -n "$BASE_DIR_FROM_ENV" && "$BASE_DIR_FROM_ENV" != "$BASE_DIR_FROM_UNIT" ]]; then
+  echo "    NOTE .env sets BASE_DIR=$BASE_DIR_FROM_ENV, which overrides the unit's $BASE_DIR_FROM_UNIT"
+  echo "         The containers use /data for the same tree; make sure both resolve to one place."
+fi
 HEARTBEAT="$SERVICE_BASE_DIR/logs/gps.json"
 
 echo "==> state directory $SERVICE_BASE_DIR/logs"

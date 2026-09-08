@@ -76,6 +76,10 @@ MOVING_SPEED_THRESHOLD_MPH = env_float("MOVING_SPEED_THRESHOLD_MPH", 1.0)
 # never went anywhere, and is deleted. 250 feet.
 DRIVE_MIN_DISPLACEMENT_MILES = env_float("DRIVE_MIN_DISPLACEMENT_MILES", 0.047)
 
+# Every table with a drive_id column. Kept next to the schema's consumers so
+# that adding one to db.py without adding it here is a visible omission.
+DRIVE_ID_TABLES = ("polls", "clips", "plate_detections", "face_detections")
+
 
 class TeslaFleetClient:
     """
@@ -298,9 +302,13 @@ def discard_drive_that_went_nowhere(connection, drive_id: str) -> bool:
         # No located polls at all - nothing could have been observed on it.
         pass
 
-    connection.execute(
-        "UPDATE polls SET drive_id=NULL WHERE drive_id=?", (drive_id,)
-    )
+    # Every table that carries drive_id, not only polls. Detections and clips
+    # are stamped with it by location_at(), and correlate.py counts
+    # distinct_drives from the detection's own column without joining back to
+    # drives - so a reference left behind here keeps a deleted phantom in the
+    # score forever, invisibly. The literal tuple is the whole allowlist.
+    for table in DRIVE_ID_TABLES:
+        connection.execute(f"UPDATE {table} SET drive_id=NULL WHERE drive_id=?", (drive_id,))
     connection.execute("DELETE FROM drives WHERE id=?", (drive_id,))
     return True
 

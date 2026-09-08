@@ -40,6 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.common import DB_PATH                                   # noqa: E402
 from src.db import connect                                       # noqa: E402
 from src.geo import haversine_miles                              # noqa: E402
+from src.poller import DRIVE_ID_TABLES                           # noqa: E402
 
 # The gate opens at 50m. This is deliberately more generous: it is deciding
 # whether to DELETE, so the benefit of the doubt goes to keeping a drive.
@@ -114,14 +115,15 @@ def main() -> int:
 
     orphaned = sum(count for _, _, count in phantom)
     print(f"\n{len(phantom)} drives would be deleted; {orphaned} polls would be "
-          f"kept with drive_id set to NULL")
+          f"kept with drive_id set to NULL (and unlinked from clips and detections)")
 
     if not arguments.execute:
         print("\nDRY RUN - nothing written. Re-run with --execute to apply.")
         return 0
 
     for drive, _, _ in phantom:
-        connection.execute("UPDATE polls SET drive_id=NULL WHERE drive_id=?", (drive["id"],))
+        for table in DRIVE_ID_TABLES:
+            connection.execute(f"UPDATE {table} SET drive_id=NULL WHERE drive_id=?", (drive["id"],))
         connection.execute("DELETE FROM drives WHERE id=?", (drive["id"],))
     connection.commit()
     print(f"\ndeleted {len(phantom)} phantom drives, relinked {orphaned} polls")

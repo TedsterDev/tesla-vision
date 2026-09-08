@@ -9,9 +9,15 @@ services:
     env_file: .env
     environment:
       - PYTHONPATH=/app
+      # Belt and braces: clipmeta.py parses clip times in CLIP_TIMEZONE
+      # regardless, but logs and anything else that asks the OS should agree.
+      - TZ=America/Los_Angeles
       - BASE_DIR=/data
-      # Don't scan real TeslaCam while Tesla is writing.
-      # We'll populate /data/inbox via a host-side ingest script later.
+      # The processor does NOT read the car's volume. The host-side
+      # ingest.service (src/ingest.py, deploy/ingest.service) copies finished
+      # clips into /data/inbox, and only while the volume is not being offered
+      # to the car over USB - a decision that needs configfs, which this
+      # container should never see. This stub stays empty on purpose.
       - TESLACAM_DIR=/data/teslacam_stub/TeslaCam
       - YOLO_CONFIG_DIR=/data/.config
       # Model weights for the ALPR and face stages; ./scripts/fetch_models.sh
@@ -31,6 +37,9 @@ services:
     env_file: .env
     environment:
       - PYTHONPATH=/app
+      # Belt and braces: clipmeta.py parses clip times in CLIP_TIMEZONE
+      # regardless, but logs and anything else that asks the OS should agree.
+      - TZ=America/Los_Angeles
       - BASE_DIR=/data
     restart: unless-stopped
 
@@ -47,6 +56,9 @@ services:
     env_file: .env
     environment:
       - PYTHONPATH=/app
+      # Belt and braces: clipmeta.py parses clip times in CLIP_TIMEZONE
+      # regardless, but logs and anything else that asks the OS should agree.
+      - TZ=America/Los_Angeles
       - BASE_DIR=/data
     restart: unless-stopped
 
@@ -63,6 +75,9 @@ services:
     environment:
       - BASE_DIR=/data
       - PYTHONPATH=/app
+      # Belt and braces: clipmeta.py parses clip times in CLIP_TIMEZONE
+      # regardless, but logs and anything else that asks the OS should agree.
+      - TZ=America/Los_Angeles
       - MODELS_DIR=/data/models
       # The Settings page constructs a PlateReader, which loads ultralytics.
       # Without this it writes its config into the container's ephemeral HOME
