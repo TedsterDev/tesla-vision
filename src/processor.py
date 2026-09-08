@@ -45,7 +45,6 @@ from src.common import (
     FACE_CROPS_DIR,
     TESLACAM_DIR,
     PROCESSED_DIR,
-    file_is_stable,
     INBOX_DIR,
     GIF_QUEUE_DIR,
     ALERTS_DIR,
@@ -53,6 +52,7 @@ from src.common import (
     PLATE_CROPS_DIR,
 )
 from src.clipmeta import detect_clip_source, describe_clip, parse_clip_filename
+from src.ingest import iterate_new_clips, safe_copy_to_inbox
 from src.db import connect, now_ts, upsert
 from src.poller import location_at
 
@@ -122,53 +122,6 @@ COCO_MODEL_FILENAME = "yolo26n.pt"
 # YOLO runs at this width; boxes are scaled back to full resolution before the
 # plate reader sees them, because plate crops need every pixel they can get.
 YOLO_INPUT_WIDTH = env_int("YOLO_INPUT_WIDTH", 640)
-
-
-def iterate_new_clips(root: Path):
-    """
-    Yield MP4 paths under the TeslaCam directory.
-
-    Tesla typically writes into subfolders like:
-        TeslaCam/RecentClips/
-        TeslaCam/SentryClips/
-        TeslaCam/SavedClips/
-
-    We use rglob("*.mp4") so we don't have to hard-code the folder names.
-    """
-
-    # Passed directory does not exist
-    if not root.exists():
-        return
-
-    for mp4file in root.rglob("*.mp4"):
-        yield mp4file
-
-
-def safe_copy_to_inbox(src: Path) -> Path | None:
-    """
-    Copy Tesla-written file to INBOX once it is stable (size stops changing).
-
-    Implementation details:
-    - If a clip is mid-write, file_is_stable returns False and we skip it for now.
-    - We copy to a temporary file first, then rename to final name. Renames within the same filesystem are atomic (prevents partial files in inbox).
-    """
-    # Ignore dotfiles just in case
-    if src.name.startswith("."):
-        return None
-    # Only proceed when Tesla appears to be done writing this clip.
-    if not file_is_stable(src):
-        return None
-
-    dest = INBOX_DIR / src.name
-    if dest.exists():
-        # Already copied.
-        return None
-
-    temporary = INBOX_DIR / f".tmp_{src.name}"
-    shutil.copy2(src, temporary)    # copy2 preserves timestamps/metadata where possible
-    temporary.rename(dest)          # atomic rename into final path
-
-    return dest
 
 
 def register_clip(connection, clip_path: Path, source_path: Path | None = None) -> str:

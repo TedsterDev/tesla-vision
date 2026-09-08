@@ -118,12 +118,16 @@ Re-runs the new stages over clips already in `processed/`. Resumable.
 ## Architecture
 
 ```
-Tesla ──USB-C──> Jetson gadget (3550000.usb) ──> /mnt/teslacam ──┐
-                                                                 │
+Tesla ──USB-C──> Jetson gadget (3550000.usb) ──> /mnt/teslacam
+                                                       │
+                     ingest.service (host) ── copies finished clips, only
+                                                       │   while the car does NOT
+                                                       ▼   hold the volume
+                                                     inbox/
+                                                       │
                           NATIX VX360 <── natix_worker (USB-A) ──┤
                                                                  │
-  processor ──┬─ ingest (stability-checked copy)
-              ├─ clipmeta   camera + capture time from filename
+  processor ──┬─ clipmeta   camera + capture time from filename
               ├─ YOLO       people and vehicles
               ├─ alpr       localize → rectify → legibility gate → OCR → vote
               ├─ faces      YuNet detect → SFace embed → cluster to identity
@@ -461,7 +465,8 @@ reproducible from the archive at any time, and free to lose.
 
 Two things follow from that date range which are worth chasing separately:
 the stick has not uploaded in four weeks, which points at it having no WiFi;
-and the Jetson's own archive has ingested nothing since February.
+and the Jetson's own archive had ingested nothing since February - because
+nothing fed the inbox; see "Feeding the inbox: ingest.service".
 
 Do NOT set `NATIX_IGNORE_FREE_SPACE` for this. The free-space figure was
 verified accurate by `--write-test`: 362 MB free, 256 MB written, 106 MB left.
@@ -669,6 +674,92 @@ the street name **is** the home address. An earlier version scrubbed the numbers
 and passed "1425 Camino De Los Coches" through untouched, which is worse than no
 redaction: the redaction that is there makes the file look safe.
 
+
+## Feeding the inbox: ingest.service
+
+Nothing had been ingested since February, and every service reported healthy.
+Commit `a5f4def` moved the processor onto "an inbox basis" so it would stop
+scanning a volume the car was still writing, and left a comment promising a
+host-side ingest script "later". This is that script.
+
+### Why it cannot simply read /mnt/teslacam
+
+The car does not write to a directory. The Jetson **exports a block device**
+to the car over USB (`scripts/usb_mode_tesla.sh` offers
+`/dev/disk/by-label/TESLACAM` as a mass-storage LUN) and the car treats it as
+a USB stick. While that export is live the car owns the filesystem. Mounting
+it on the host at the same time - which the fstab entry will do - is two
+operating systems holding one volume with no coordination. That is how
+footage gets corrupted, and it is the exact thing `a5f4def` was avoiding.
+
+So `src/ingest.py` enforces one rule: **it never reads the volume while the
+gadget is offering it to the car.** It reads configfs to know, which is why it
+is a host service and not a container - configfs is not something a container
+should be shown. It copies stable clips into `inbox/` with the same
+temp-then-rename the processor used, and the processor consumes whatever
+appears.
+
+### The cycle it expects
+
+Until the volume is mounted, the service idles and says so - the same way
+`gps.py` idles without a receiver, and for the same reason: "nothing to
+ingest" and "ingest is broken" must never look alike. The heartbeat at
+`logs/ingest.json` carries `state` as one of:
+
+| state | meaning |
+|---|---|
+| `absent` | `/mnt/teslacam` is not mounted. Nothing to do. |
+| `exported` | mounted, **but the car has it**. The service will not read it. |
+| `ready` | mounted and not exported. Copying. |
+
+Getting from `exported` to `ready` is a root operation the code does not yet
+automate:
+
+```
+sudo ./scripts/usb_gadget_stop.sh      # stop offering the volume to the car
+sudo mount /mnt/teslacam               # now the host may read it
+# ingest.service copies anything new within INGEST_POLL_SECONDS
+sudo umount /mnt/teslacam
+sudo ./scripts/usb_mode_tesla.sh       # offer it to the car again
+```
+
+Automating that on a timer - or on the car going to sleep - is the piece that
+needs the hardware present to finish. On this bench there is no `TESLACAM`
+partition attached, so the service has been verified against a directory and
+a fake gadget tree (`tests/test_ingest.py`), not against a car.
+
+### Installing it
+
+```
+sudo ./scripts/install_ingest.sh
+```
+
+Installs the unit, enables it, and checks three things separately: the
+service is active, the heartbeat is fresh, and whether the source is mounted.
+
+### Clip timestamps are parsed in the car's zone, not the process's
+
+Tesla names each clip with the car's **local** wall-clock time. The first
+parser used a naive `datetime` and `.timestamp()`, which interprets it in the
+process's zone - and every container runs in UTC. Every clip was stored 7-8
+hours early. Not cosmetic: `location_at()` takes that timestamp to the polls
+table, so every detection was placed where the car had been hours earlier -
+usually parked at home - which zeroes the drive signal and fires the
+"anchored to one location" suppression on exactly the vehicles this system
+exists to notice.
+
+`clipmeta.py` now parses in `CLIP_TIMEZONE` (default `America/Los_Angeles`)
+and refuses to import if that zone cannot be loaded, because a wrong zone that
+parses successfully is the failure above. Rows stored before the fix are
+corrected by
+
+```
+sudo env BASE_DIR=/mnt/jetsondata/tesla-alerts python3 scripts/migrate_clip_timezone.py --execute
+```
+
+which recomputes every `clips.captured_ts` and `alerts.timestamp` from the
+filename, and is idempotent: a row that is already right recomputes to the
+same number.
 
 ## Verifying the pipeline actually works
 
