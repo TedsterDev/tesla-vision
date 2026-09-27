@@ -62,11 +62,26 @@ elif [[ "$STRAY_FILES" -eq 0 ]]; then
   skip "no stray data under /mnt/natixv360"
 else
   echo "    $STRAY_FILES stray files on the SD card under /mnt/natixv360 (reproducible SentryClips)"
-  [[ -n "$RESCUE" ]] || fail "no rescue directory under $BASE_DIR/natix-rescue - will not clear the stray without one"
-  echo "    rescue to restore: $RESCUE ($(du -sh "$RESCUE" | cut -f1))"
   run systemctl stop natix-mirror
-  run ./scripts/natix_fsck.sh --clean-stray
-  run ./scripts/natix_reformat.sh --restore-only
+  if [[ -n "$RESCUE" ]]; then
+    echo "    rescue to restore: $RESCUE ($(du -sh "$RESCUE" | cut -f1))"
+    run ./scripts/natix_fsck.sh --clean-stray
+    run ./scripts/natix_reformat.sh --restore-only
+  else
+    # No rescue means the stick was never reformatted, so there is nothing to
+    # restore. The stray may also be the only copy of those clips on this box
+    # (processed/ was empty on 2026-09-27), so move it aside - same filesystem,
+    # an instant rename - instead of deleting it.
+    KEEP="$BASE_DIR/natix-stray/$(date +%Y%m%d-%H%M%S)"
+    echo "    no rescue dir - stick never reformatted; moving the stray to $KEEP ($(du -sh /mnt/natixv360 | cut -f1))"
+    run mkdir -p "$KEEP"
+    run find /mnt/natixv360 -mindepth 1 -maxdepth 1 -exec mv -t "$KEEP" {} +
+    if [[ $EXECUTE -eq 1 ]]; then
+      [[ -z "$(ls -A /mnt/natixv360)" ]] || fail "/mnt/natixv360 still not empty after the move"
+      [[ "$(find "$KEEP" -type f | wc -l)" -eq "$STRAY_FILES" ]] || fail "file count in $KEEP does not match the $STRAY_FILES stray files"
+      ok "$STRAY_FILES files kept at $KEEP; mountpoint empty"
+    fi
+  fi
   run systemctl start natix-mirror
   if [[ $EXECUTE -eq 1 ]]; then
     sleep 20
