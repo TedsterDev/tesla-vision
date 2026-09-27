@@ -28,6 +28,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # signed JWT it forwards has to be checked properly rather than trusted.
 RUN pip install --no-cache-dir "PyJWT[crypto]>=2.8"
 
+# OpenCV 5 removed cv2.CascadeClassifier and the bundled haarcascades, which
+# both Haar fallbacks (faces.py, alpr.py) rely on - an unpinned rebuild on
+# 2026-09-08 picked up 5.0.0 and crash-looped the processor. Pinned here, not
+# in requirements.txt, for the same cache reason as PyJWT above.
+RUN pip install --no-cache-dir "opencv-python<5"
+
 COPY src/ /app/src
 
 # Tests and the backfill utility ship in the image so they can be run against
