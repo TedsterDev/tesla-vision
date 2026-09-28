@@ -6,3 +6,5 @@ watchdog
 pillow
 imageio
 imageio-ffmpeg
+# ALPR character recognition (needs the tesseract-ocr binary, see docker/Dockerfile)
+pytesseract

@@ -24,6 +24,9 @@ dist/
 .env.*
 !.env.example
 
+# runtime logs
+*.log
+
 # OS/editor
 .DS_Store
 .vscode/

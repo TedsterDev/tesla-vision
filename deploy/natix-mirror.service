@@ -1,0 +1,76 @@
+[Unit]
+Description=NATIX VX360 mirror - copies TeslaCam footage onto the VX360 stick
+Documentation=file:/home/tedster/projects/tesla-alerts/README.md
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=simple
+# Runs as root, and that is the design rather than an oversight:
+#   - mounting a block device needs CAP_SYS_ADMIN
+#   - scout.db is written by root-owned containers, so a non-root writer
+#     would be locked out of the database it has to record copies in
+# The alternative - an unprivileged user plus a NOPASSWD sudoers rule for
+# natix_mount.sh - creates a permanent escalation path for a service that
+# already needs root for half its job. One root service is the smaller
+# surface, and it is confined below.
+User=root
+WorkingDirectory=/home/tedster/projects/tesla-alerts
+EnvironmentFile=-/home/tedster/projects/tesla-alerts/.env
+Environment=PYTHONPATH=/home/tedster/projects/tesla-alerts
+Environment=BASE_DIR=/mnt/jetsondata/tesla-alerts
+ExecStart=/usr/bin/python3 -u /home/tedster/projects/tesla-alerts/src/natix_worker.py
+
+# NO ExecStop unmount. The worker unmounts itself on SIGTERM, and having the
+# unit do it too is a race that puts footage on the host SD card.
+#
+# systemd runs ExecStop *before* signalling the main process, so on
+# `systemctl stop` the umount fired while the worker was still mid-copy. The
+# FUSE daemon went away underneath it and the copy failed with
+#
+#     error: 2026-02-16_21-34-23-back.mp4: [Errno 103] Software caused connection abort
+#
+# after which the remaining writes in that pass landed in the now-bare
+# /mnt/natixv360 directory - on the Jetson's own SD card, 762MB of it, which
+# then blocked every later mount with "mountpoint is not empty".
+#
+# natix_worker.py installs SIGTERM and SIGINT handlers that finish the current
+# file and unmount before exiting, and TimeoutStopSec below gives it room to
+# do that. One owner of the mount, and it is the process doing the writing.
+# Do not reintroduce an ExecStop that touches the mount.
+
+Restart=always
+RestartSec=15
+TimeoutStopSec=60
+
+# Confinement - and specifically, NO mount-namespace sandboxing.
+#
+# This unit previously set ProtectHome, ReadWritePaths and
+# ProtectKernelTunables. Every one of those puts the unit in a private mount
+# namespace, and ReadWritePaths goes further: systemd *bind-mounts* each listed
+# path onto itself so it can be made writable. Listing /mnt/natixv360 there
+# meant systemd had already mounted something at the mountpoint before the
+# service ran, which is why the journal showed
+#
+#     /mnt/natixv360 already has /dev/mmcblk0p1[/mnt/natixv360] mounted
+#
+# and, before the mount verification existed, is the most likely reason a mount
+# silently failed and 1.1GB of clips went onto the Jetson's own SD card.
+#
+# A service whose entire job is mounting a filesystem at a fixed path cannot be
+# sandboxed by rearranging its mounts underneath it. So the mount-affecting
+# options are gone, deliberately, and what remains are the protections that do
+# not touch the mount table.
+#
+# Do NOT add ProtectSystem, ProtectHome, ReadWritePaths, PrivateTmp,
+# ProtectKernelTunables or SystemCallFilter=@system-service here.
+# The last one is a particular trap: @system-service excludes @mount, so it
+# would block the mount(2) call this service exists to make.
+NoNewPrivileges=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

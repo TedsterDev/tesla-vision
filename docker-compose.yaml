@@ -6,13 +6,23 @@ services:
     command: ["python", "-u", "src/processor.py"]
     volumes:
       - /mnt/jetsondata/tesla-alerts:/data
+    env_file: .env
     environment:
       - PYTHONPATH=/app
+      # Belt and braces: clipmeta.py parses clip times in CLIP_TIMEZONE
+      # regardless, but logs and anything else that asks the OS should agree.
+      - TZ=America/Los_Angeles
       - BASE_DIR=/data
-      # Don't scan real TeslaCam while Tesla is writing.
-      # We'll populate /data/inbox via a host-side ingest script later.
+      # The processor does NOT read the car's volume. The host-side
+      # ingest.service (src/ingest.py, deploy/ingest.service) copies finished
+      # clips into /data/inbox, and only while the volume is not being offered
+      # to the car over USB - a decision that needs configfs, which this
+      # container should never see. This stub stays empty on purpose.
       - TESLACAM_DIR=/data/teslacam_stub/TeslaCam
       - YOLO_CONFIG_DIR=/data/.config
+      # Model weights for the ALPR and face stages; ./scripts/fetch_models.sh
+      # downloads them into this directory on the host.
+      - MODELS_DIR=/data/models
     restart: unless-stopped
 
   gif_worker:
@@ -22,8 +32,33 @@ services:
     command: ["python", "-u", "src/gif_worker.py"]
     volumes:
       - /mnt/jetsondata/tesla-alerts:/data
+    # gif_worker reads GIF_SECONDS / GIF_FPS / GIF_SCALE_WIDTH, so it needs .env
+    # like every other service. Without this those knobs are silently inert.
+    env_file: .env
     environment:
       - PYTHONPATH=/app
+      # Belt and braces: clipmeta.py parses clip times in CLIP_TIMEZONE
+      # regardless, but logs and anything else that asks the OS should agree.
+      - TZ=America/Los_Angeles
+      - BASE_DIR=/data
+    restart: unless-stopped
+
+  # Vehicle telemetry: the port of Scout's TeslaJS poll.js. Without Tesla API
+  # credentials in .env this exits immediately with an explanation, which is a
+  # supported way to run - detections just won't carry GPS context.
+  poller:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    command: ["python", "-u", "src/poller.py"]
+    volumes:
+      - /mnt/jetsondata/tesla-alerts:/data
+    env_file: .env
+    environment:
+      - PYTHONPATH=/app
+      # Belt and braces: clipmeta.py parses clip times in CLIP_TIMEZONE
+      # regardless, but logs and anything else that asks the OS should agree.
+      - TZ=America/Los_Angeles
       - BASE_DIR=/data
     restart: unless-stopped
 
@@ -40,4 +75,12 @@ services:
     environment:
       - BASE_DIR=/data
       - PYTHONPATH=/app
+      # Belt and braces: clipmeta.py parses clip times in CLIP_TIMEZONE
+      # regardless, but logs and anything else that asks the OS should agree.
+      - TZ=America/Los_Angeles
+      - MODELS_DIR=/data/models
+      # The Settings page constructs a PlateReader, which loads ultralytics.
+      # Without this it writes its config into the container's ephemeral HOME
+      # instead of sharing the processor's, and loses it on every recreate.
+      - YOLO_CONFIG_DIR=/data/.config
     restart: unless-stopped
