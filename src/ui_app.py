@@ -3094,14 +3094,12 @@ def timeline_view():
     Scout's Timeline.vue - drives drawn on a Leaflet map with detections pinned
     where they happened.
 
-    Leaflet loads from a CDN. In a parked car with no signal the map tiles
-    won't render; the rest of the dashboard is unaffected, which is why the map
-    lives on its own page rather than on the front one.
+    Leaflet itself is served from the Orin once scripts/fetch_leaflet.sh has
+    run (the CDN otherwise). The map TILES still come from OpenStreetMap, so in
+    a parked car with no signal the base map stays blank; the tracks and the
+    rest of the dashboard are unaffected.
     """
-    head_extra = """
-      <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-      <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-    """
+    head_extra = leaflet_head(defer=False)
 
     body = """
       <h1>Timeline</h1>
@@ -5399,16 +5397,17 @@ def gps_view():
 # no-referrer keeps this dashboard's URL out of them, but the tile coordinates
 # are the request. The existing /timeline page already makes that trade; if it
 # ever stops being acceptable, the fix is a local tile cache, not a smaller z.
-def _findmy_map_head() -> str:
+def leaflet_head(defer: bool = True) -> str:
     """
     Load Leaflet locally if it is actually vendored, and from the CDN if not.
 
-    The local paths were the whole story here, and MEDIA_DIR/leaflet does not
-    exist and nothing in this repository creates it - so every request 404ed,
-    `L` was never defined, and the map simply never appeared. Falling back to
-    the same CDN /timeline already uses means the map works out of the box; the
-    source is stamped into the page so the failure message can name what was
+    scripts/fetch_leaflet.sh puts an integrity-checked copy in
+    MEDIA_DIR/leaflet; until it has run, the CDN keeps the maps working. The
+    source is stamped into the page so a failure message can name what was
     tried instead of blaming the network for a missing directory.
+
+    defer=False is for pages whose own inline script needs `L` as soon as it
+    runs (the Timeline).
     """
     vendored_script = MEDIA_DIR / "leaflet" / "leaflet.js"
     vendored_style = MEDIA_DIR / "leaflet" / "leaflet.css"
@@ -5424,7 +5423,7 @@ def _findmy_map_head() -> str:
     return f"""
 <link rel="stylesheet" href="{style_href}" />
 <script>window.__leafletSource = "{esc(source)}";</script>
-<script defer src="{script_src}"
+<script {"defer " if defer else ""}src="{script_src}"
         onerror="window.__leafletUnavailable = true;"></script>
 """
 
@@ -5995,7 +5994,7 @@ def findmy_view():
 </script>
 """
     page = render_page("Find My", body + script, "/findmy",
-                       LOCATION_PAGE_HEAD + _findmy_map_head())
+                       LOCATION_PAGE_HEAD + leaflet_head())
     # See the note in gps_view: a handler that returns a finished Response gets
     # it passed straight through, so the headers have to be set on it here.
     _apply_location_headers(page)

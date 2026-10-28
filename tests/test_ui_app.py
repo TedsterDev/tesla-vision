@@ -541,12 +541,26 @@ def test_the_location_pages_are_uncacheable_and_referrer_free():
 # ---------------------------------------------------------------------------
 def test_the_map_is_loaded_from_somewhere_that_exists():
     page = ui_app.findmy_view().body.decode("utf-8")
-    head = ui_app._findmy_map_head()
+    head = ui_app.leaflet_head()
     assert "/media/leaflet/leaflet.js" not in head or (
         (ui_app.MEDIA_DIR / "leaflet" / "leaflet.js").exists()), head
     assert "leaflet.js" in head, head
     assert "__leafletSource" in head, head
     assert "__leafletSource" in page, "the failure message cannot name its source"
+
+
+def test_the_timeline_prefers_the_local_leaflet_and_loads_it_synchronously():
+    leaflet = ui_app.MEDIA_DIR / "leaflet"
+    leaflet.mkdir(parents=True, exist_ok=True)
+    (leaflet / "leaflet.js").write_text("")
+    (leaflet / "leaflet.css").write_text("")
+    try:
+        _, _, page = render("/timeline")
+        assert "/media/leaflet/leaflet.js" in page and "unpkg.com" not in page, page[:400]
+        # Its inline map script needs L at once: no defer.
+        assert "defer src=" not in page.split("leaflet.js")[0].rsplit("<script", 1)[-1] + "leaflet.js"
+    finally:
+        shutil.rmtree(leaflet)
 
 
 def test_going_stale_demotes_the_map_links_and_the_pin():
