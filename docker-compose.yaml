@@ -101,8 +101,12 @@ services:
       context: .
       dockerfile: docker/Dockerfile
     command: ["uvicorn", "src.ui_app:app", "--host", "0.0.0.0", "--port", "8080"]
+    # WEB_BIND (from .env) picks the host address. 0.0.0.0, the default, also
+    # answers anyone on the local Wi-Fi - Docker's published ports bypass ufw.
+    # scripts/close_lan_8080.sh sets 127.0.0.1: the Cloudflare tunnel already
+    # uses that, and `tailscale serve` forwards the tailnet address to it.
     ports:
-      - "8080:8080"
+      - "${WEB_BIND:-0.0.0.0}:8080:8080"
     # The CUDA libraries but NOT the nvidia runtime: the Settings page imports
     # torch (via PlateReader), and the JetPack wheel will not load without
     # them, but this process should stay on the CPU rather than take a CUDA
