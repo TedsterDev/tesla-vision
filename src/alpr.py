@@ -67,6 +67,19 @@ MIN_OCR_CONFIDENCE = env_float("MIN_OCR_CONFIDENCE", 60.0)
 
 PLATE_DETECTOR_WEIGHTS = MODELS_DIR / "plate_detector.pt"
 
+# A recognizer trained on licence plates (fast-plate-ocr, CCT-S v2 global),
+# tried before Tesseract. On the NATIX night footage Tesseract read nothing,
+# not even from the clearest 100x70 px plates; this model read the same plate
+# from frame after frame. Staged by scripts/fetch_models.sh.
+PLATE_OCR_DIR = MODELS_DIR / "plate_ocr"
+PLATE_OCR_MODEL = PLATE_OCR_DIR / "cct_s_v2_global.onnx"
+PLATE_OCR_CONFIG = PLATE_OCR_DIR / "cct_s_v2_global_plate_config.yaml"
+# Mean per-character probability a plate-model read needs to count. Below it
+# the read is discarded and Tesseract gets its turn.
+MIN_PLATE_MODEL_CONFIDENCE = env_float("MIN_PLATE_MODEL_CONFIDENCE", 0.6)
+# ONNX runtime threads: the processor is also decoding video on the CPU.
+PLATE_MODEL_THREADS = env_int("PLATE_MODEL_THREADS", 2)
+
 # How many vehicles per frame to hand the plate detector, largest first.
 # Detector cost is per-crop, and the largest box is the nearest vehicle, which
 # is the only one whose plate has any chance of being legible anyway.
@@ -390,6 +403,7 @@ class PlateReader:
         self.yolo_plate_model = None
         self.haar_cascade = None
         self.tesseract = None
+        self.plate_model = None
         self.reasons_unavailable: list[str] = []
         # Plates we found but could not read. Surfaced in logs and the Settings
         # page so "no plates" is distinguishable from "plates too dark to read",
@@ -419,7 +433,21 @@ class PlateReader:
                     print("[🔎 alpr] using Haar cascade plate localizer (no YOLO plate weights found)")
 
     def _load_ocr(self) -> None:
-        """Import pytesseract lazily so a missing binary degrades, not crashes."""
+        """Load the plate model and Tesseract; either alone is enough to read."""
+        if PLATE_OCR_MODEL.exists() and PLATE_OCR_CONFIG.exists():
+            try:
+                import onnxruntime
+                from fast_plate_ocr import LicensePlateRecognizer
+                options = onnxruntime.SessionOptions()
+                options.intra_op_num_threads = PLATE_MODEL_THREADS
+                self.plate_model = LicensePlateRecognizer(
+                    onnx_model_path=PLATE_OCR_MODEL, plate_config_path=PLATE_OCR_CONFIG,
+                    device="cpu", sess_options=options,
+                )
+            except Exception as exception_object:
+                self.reasons_unavailable.append(f"plate OCR model failed to load: {exception_object}")
+
+        # Import pytesseract lazily so a missing binary degrades, not crashes.
         try:
             import pytesseract
             # Fail fast and loudly here rather than once per frame later.
@@ -432,13 +460,15 @@ class PlateReader:
     def available(self) -> bool:
         """True when we can both find and read a plate."""
         has_localizer = self.yolo_plate_model is not None or self.haar_cascade is not None
-        return has_localizer and self.tesseract is not None
+        return has_localizer and (self.tesseract is not None or self.plate_model is not None)
 
     def status_text(self) -> str:
         """One-line summary for startup logs and the dashboard's Settings view."""
         if self.available:
             localizer = "yolo" if self.yolo_plate_model else "haar"
-            return f"ready (localizer={localizer}, ocr=tesseract)"
+            readers = [name for name, engine in (("plate-model", self.plate_model),
+                                                 ("tesseract", self.tesseract)) if engine is not None]
+            return f"ready (localizer={localizer}, ocr={'+'.join(readers)})"
         return "disabled - " + "; ".join(self.reasons_unavailable or ["no plate localizer available"])
 
     # -- step 1: localize -------------------------------------------------
@@ -614,6 +644,31 @@ class PlateReader:
         return accepted
 
     # -- step 3: recognize ------------------------------------------------
+    def recognize_with_plate_model(self, plate_image: np.ndarray) -> tuple[str, float]:
+        """
+        Read a plate crop with the plate-trained model.
+
+        Returns (text, mean_confidence_0_to_1) over the characters it actually
+        read - not over the padding slots, which it is always sure about and
+        which would make an empty read look confident. ("", 0.0) when nothing.
+        """
+        if self.plate_model is None or plate_image.size == 0:
+            return "", 0.0
+        try:
+            prediction = self.plate_model.run(plate_image, return_confidence=True,
+                                              remove_pad_char=False)[0]
+        except Exception:
+            return "", 0.0
+        slots = prediction.plate
+        probabilities = list(prediction.char_probs) if prediction.char_probs is not None else []
+        pad = getattr(getattr(self.plate_model, "config", None), "pad_char", "_") or "_"
+        kept = [(character, probability) for character, probability in zip(slots, probabilities)
+                if character != pad]
+        if not kept:
+            return "", 0.0
+        text = "".join(character for character, _ in kept)
+        return text, float(sum(probability for _, probability in kept) / len(kept))
+
     def recognize(self, plate_image: np.ndarray) -> tuple[str, float]:
         """
         Read characters off a rectified plate crop.
@@ -687,6 +742,29 @@ class PlateReader:
 
             crop = frame[y0:y1, x0:x1]
             if crop.size == 0:
+                continue
+
+            # The plate model first, on the tight box it was trained on. It
+            # reports its own confidence, so it does not need the legibility
+            # gate below - which exists to stop Tesseract guessing at noise,
+            # and which rejected crops this model reads.
+            if self.plate_model is not None:
+                tight = frame[max(0, y):y + h, max(0, x):x + w]
+                text, model_confidence = self.recognize_with_plate_model(tight)
+                normalized = normalize_plate_text(text)
+                if model_confidence >= MIN_PLATE_MODEL_CONFIDENCE and looks_like_plate_text(normalized):
+                    found.append(PlateCandidate(
+                        text=normalized,
+                        raw_text=text,
+                        det_confidence=det_confidence,
+                        ocr_confidence=model_confidence,
+                        bbox=(x, y, w, h),
+                        frame_number=frame_number,
+                        crop=crop,
+                    ))
+                    continue
+
+            if self.tesseract is None:
                 continue
 
             rectified = rectify_plate(crop)

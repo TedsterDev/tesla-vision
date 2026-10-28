@@ -55,6 +55,12 @@ RUN pip install --no-cache-dir "PyJWT[crypto]>=2.8"
 # in requirements.txt, for the same cache reason as PyJWT above.
 RUN pip install --no-cache-dir "opencv-python<5"
 
+# A licence-plate OCR model (src/alpr.py reads with it before Tesseract) and
+# the ONNX runtime it needs. Its own layer for the same cache reason as above;
+# PIP_CONSTRAINT keeps numpy<2 under it. The weights are staged on the data
+# volume by scripts/fetch_models.sh, so the car never downloads at runtime.
+RUN pip install --no-cache-dir "fast-plate-ocr==1.1.0" "onnxruntime==1.23.2"
+
 COPY src/ /app/src
 
 # Tests and the backfill utility ship in the image so they can be run against

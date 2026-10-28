@@ -34,7 +34,8 @@ download() {
     echo "         <- $url"
     if curl -fsSL --retry 2 --connect-timeout 15 -o "$destination.part" "$url"; then
       # A GitHub 404 page is a valid HTTP 200 body sometimes; check for size.
-      if [ "$(stat -c%s "$destination.part" 2>/dev/null || echo 0)" -gt 100000 ]; then
+      # MIN_BYTES lowers the bar for files that are legitimately small.
+      if [ "$(stat -c%s "$destination.part" 2>/dev/null || echo 0)" -gt "${MIN_BYTES:-100000}" ]; then
         mv "$destination.part" "$destination"
         echo "         ok ($(du -h "$destination" | cut -f1))"
         return 0
@@ -80,6 +81,25 @@ download "YOLO license plate detector" \
   "$MODELS_DIR/plate_detector.pt" \
   "https://huggingface.co/morsetechlab/yolov11-license-plate-detection/resolve/main/license-plate-finetune-v1n.pt" \
   "https://huggingface.co/Koushim/yolov8-license-plate-detection/resolve/main/best.pt"
+
+# --- License plate OCR: fast-plate-ocr CCT-S v2 global (~5MB) -------------
+# A recognizer trained on plates, used before Tesseract (see alpr.py). On the
+# NATIX night footage Tesseract read nothing; this read the same plate
+# consistently across a minute of frames. Pinned by hash: the release tag
+# ("arg-plates") is shared by several files and could in principle move.
+mkdir -p "$MODELS_DIR/plate_ocr"
+download "plate OCR model (CCT-S v2 global)" \
+  "$MODELS_DIR/plate_ocr/cct_s_v2_global.onnx" \
+  "https://github.com/ankandrew/cnn-ocr-lp/releases/download/arg-plates/cct_s_v2_global.onnx"
+MIN_BYTES=500 download "plate OCR model config" \
+  "$MODELS_DIR/plate_ocr/cct_s_v2_global_plate_config.yaml" \
+  "https://github.com/ankandrew/cnn-ocr-lp/releases/download/arg-plates/cct_s_v2_global_plate_config.yaml"
+( cd "$MODELS_DIR/plate_ocr" && sha256sum -c --quiet - <<'SUMS' ) \
+  || { echo "  [FAIL] plate OCR files do not match their pinned hashes - removing them"; \
+       rm -f "$MODELS_DIR/plate_ocr/cct_s_v2_global.onnx" "$MODELS_DIR/plate_ocr/cct_s_v2_global_plate_config.yaml"; }
+384bbbd2cea3ef54761d3df70822ef3a349ee1a112aeafddbe0e3ba06bc6e47b  cct_s_v2_global.onnx
+0335c74a305173bb6f393efed0fde03cadeaa0b649ed8e19f431016d8232d0a6  cct_s_v2_global_plate_config.yaml
+SUMS
 
 echo
 echo "Done. Present in $MODELS_DIR:"

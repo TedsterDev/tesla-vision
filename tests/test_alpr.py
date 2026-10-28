@@ -130,6 +130,46 @@ def test_voting_prefers_frame_support():
     return ok
 
 
+def test_plate_model_reads_first_and_ignores_its_padding():
+    """The plate model's read wins when confident; its pad slots never count."""
+    from src.alpr import PlateReader
+
+    class Prediction:
+        def __init__(self, plate, probs):
+            self.plate, self.char_probs = plate, np.array(probs)
+
+    class FakePlateModel:
+        config = type("Config", (), {"pad_char": "_"})()
+
+        def __init__(self, prediction):
+            self.prediction = prediction
+
+        def run(self, image, return_confidence=False, remove_pad_char=True):
+            return [self.prediction]
+
+    reader = PlateReader.__new__(PlateReader)
+    reader.yolo_plate_model = object()   # "a localizer exists"; localize() is stubbed below
+    reader.haar_cascade = None
+    reader.tesseract = None
+    reader.illegible_crop_count = 0
+    reader.localize = lambda frame, boxes=None: [((10, 10, 120, 60), 0.8)]
+    frame = np.zeros((200, 300, 3), dtype=np.uint8)   # pitch black: the legibility gate would refuse it
+
+    ok = True
+    # Confident read: kept, even though Tesseract's legibility gate would refuse the crop.
+    reader.plate_model = FakePlateModel(Prediction("DN64864___", [0.9] * 7 + [1.0] * 3))
+    found = reader.read_plates(frame)
+    ok &= check("a confident plate-model read is kept", [c.text for c in found] == ["DN64864"])
+    ok &= check("confidence is over read characters only", found and abs(found[0].ocr_confidence - 0.9) < 1e-6)
+    # Padding is always certain; an empty read must not look confident.
+    reader.plate_model = FakePlateModel(Prediction("__________", [1.0] * 10))
+    ok &= check("an all-padding read is not a plate", reader.read_plates(frame) == [])
+    # Low confidence: discarded (and no Tesseract to fall back on here).
+    reader.plate_model = FakePlateModel(Prediction("DN64864___", [0.4] * 7 + [1.0] * 3))
+    ok &= check("a low-confidence read is discarded", reader.read_plates(frame) == [])
+    return ok
+
+
 def main():
     tests = [
         ("text normalization", test_normalization),
@@ -137,6 +177,7 @@ def main():
         ("legibility gate", test_legibility_gate),
         ("OCR reads a synthetic plate", test_ocr_reads_a_synthetic_plate),
         ("cross-frame voting", test_voting_prefers_frame_support),
+        ("plate model reads first", test_plate_model_reads_first_and_ignores_its_padding),
     ]
     failures = 0
     for name, test_function in tests:
