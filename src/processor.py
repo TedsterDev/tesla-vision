@@ -39,6 +39,8 @@ import cv2
 from ultralytics import YOLO
 
 from src.common import (
+    BASE_DIR,
+    JOBS_DIR,
     ensure_dirs,
     MODELS_DIR,
     env_flag,
@@ -125,6 +127,12 @@ SEEK_MIN_STEP = env_int("SEEK_MIN_STEP", 15)
 
 # What the processor is doing and how far behind it is; read by the dashboard.
 STATUS_PATH = LOGS_DIR / "processor.json"
+
+# The dashboard's demo button: a request file it drops, the clips it replays,
+# and where the demo's snapshots go (overwritten each run).
+DEMO_REQUEST_PATH = JOBS_DIR / "demo.json"
+DEMO_CLIPS_DIR = Path(os.environ.get("DEMO_CLIPS_DIR", str(BASE_DIR / "natix-stray")))
+DEMO_MEDIA_DIR = MEDIA_DIR / "demo"
 
 # After the GPU fails a clip (shared-memory exhaustion on an 8 GB Orin), run
 # on the CPU for this long before trying the GPU again.
@@ -269,6 +277,11 @@ class ClipAnalysis:
         self.plate_candidates: list = []
         self.face_observations: list = []   # (FaceDetection, embedding, frame)
         self.frames_analyzed = 0
+        # For the dashboard's progress display.
+        self.plate_frames = 0
+        self.face_frames = 0
+        self.plate_budget = 0
+        self.face_budget = 0
 
     @property
     def person_count(self) -> int:
@@ -280,7 +293,7 @@ class ClipAnalysis:
 
 
 def analyze_clip(model: YOLO, video_path: Path, plate_reader=None, face_engine=None,
-                 device: str | None = None) -> ClipAnalysis:
+                 device: str | None = None, progress=None) -> ClipAnalysis:
     """
     Run every enabled detector over one clip in a single pass.
 
@@ -288,11 +301,17 @@ def analyze_clip(model: YOLO, video_path: Path, plate_reader=None, face_engine=N
     single best snapshot - a 10-second 1280x960 clip at 3fps would otherwise
     hold ~110MB of raw frames, which on a 7.4GB box shared with three model
     runtimes is not a trade worth making.
+
+    `progress(stage, analysis)`, if given, is called after each step so the
+    dashboard can show where a clip is: "detect" after each sampled frame,
+    "plates" and "faces" after those budgeted stages run.
     """
     analysis = ClipAnalysis()
 
     alpr_budget = ALPR_MAX_FRAMES if (plate_reader and plate_reader.available) else 0
     face_budget = FACE_MAX_FRAMES if (face_engine and (face_engine.available or face_engine.detection_only)) else 0
+    analysis.plate_budget, analysis.face_budget = alpr_budget, face_budget
+    report = progress or (lambda stage, analysis: None)
     last_alpr_frame = -EXPENSIVE_STAGE_FRAME_GAP
     last_face_frame = -EXPENSIVE_STAGE_FRAME_GAP
 
@@ -310,6 +329,7 @@ def analyze_clip(model: YOLO, video_path: Path, plate_reader=None, face_engine=N
 
         results = model(frame_small, verbose=False, **({"device": device} if device else {}))
         single_frame_result = results[0]
+        report("detect", analysis)
         if single_frame_result.boxes is None:
             continue
 
@@ -354,6 +374,8 @@ def analyze_clip(model: YOLO, video_path: Path, plate_reader=None, face_engine=N
             )
             alpr_budget -= 1
             last_alpr_frame = frame_number
+            analysis.plate_frames += 1
+            report("plates", analysis)
 
         # --- Faces, budgeted, only where there is a person -----------------
         if (saw_person and face_budget > 0
@@ -366,6 +388,8 @@ def analyze_clip(model: YOLO, video_path: Path, plate_reader=None, face_engine=N
                     analysis.face_observations.append((face_detection, embedding, crop))
             face_budget -= 1
             last_face_frame = frame_number
+            analysis.face_frames += 1
+            report("faces", analysis)
 
     return analysis
 
@@ -676,13 +700,15 @@ class Detectors:
     def device(self) -> str:
         return "cuda" if self.has_gpu and time.time() >= self.gpu_retry_after else "cpu"
 
-    def analyze(self, clip: Path) -> tuple[ClipAnalysis, str]:
+    def analyze(self, clip: Path, progress=None) -> tuple[ClipAnalysis, str]:
         if not self.has_gpu:
-            return analyze_clip(self.model, clip, self.plate_reader, self.face_engine), "cpu"
+            return analyze_clip(self.model, clip, self.plate_reader, self.face_engine,
+                                progress=progress), "cpu"
 
         if self.device == "cuda":
             try:
-                return analyze_clip(self.model, clip, self.plate_reader, self.face_engine), "cuda"
+                return analyze_clip(self.model, clip, self.plate_reader, self.face_engine,
+                                    progress=progress), "cuda"
             except Exception as error:
                 if not is_gpu_failure(error):
                     raise
@@ -699,7 +725,8 @@ class Detectors:
 
         self.cpu_fallbacks += 1
         model, plate_reader = self._cpu_detectors()
-        return analyze_clip(model, clip, plate_reader, self.face_engine, device="cpu"), "cpu"
+        return analyze_clip(model, clip, plate_reader, self.face_engine, device="cpu",
+                            progress=progress), "cpu"
 
     def _cpu_detectors(self):
         if self._cpu_model is None:
@@ -731,6 +758,7 @@ class PipelineStatus:
     """
 
     IDLE_WRITE_SECONDS = 5
+    PROGRESS_WRITE_SECONDS = 1
     WINDOW = 30   # recent clips the speed figures are averaged over
 
     def __init__(self, detectors: Detectors) -> None:
@@ -742,23 +770,57 @@ class PipelineStatus:
         self.errors_total = 0
         self.last_error: str | None = None
         self.last_written = 0.0
+        self.pending: list[dict] = []
+        self.alerts_total = 0
+        self.last_alert_ts: int | None = None
+        self.correlating = False
+        self.last_correlation_ts: int | None = None
+        self.last_correlation_raised = 0
+        self.demo: "DemoFeed | None" = None
 
     def begin(self, entry: dict, pending: list[dict]) -> None:
         self.current = {
             "name": entry["name"], "camera": entry["camera"],
             "captured_ts": entry["captured_ts"], "source": entry["source"],
+            "demo": bool(entry.get("demo")),
             "started_ts": time.time(), "device": self.detectors.device,
+            "stage": "detect", "frames_done": 0, "frames_budget": SAMPLE_FRAMES_PER_CLIP,
+            "plate_frames": 0, "plate_budget": 0, "face_frames": 0, "face_budget": 0,
+            "vehicles": 0, "people": 0,
         }
         self.write(pending, force=True)
 
+    def progress(self, stage: str, analysis: "ClipAnalysis") -> None:
+        """Called from inside analyze_clip; writes at most once a second."""
+        if not self.current:
+            return
+        self.current.update(
+            stage=stage, frames_done=analysis.frames_analyzed,
+            plate_frames=analysis.plate_frames, plate_budget=analysis.plate_budget,
+            face_frames=analysis.face_frames, face_budget=analysis.face_budget,
+            vehicles=analysis.vehicle_count, people=analysis.person_count,
+            device=self.detectors.device,
+        )
+        if time.time() - self.last_written >= self.PROGRESS_WRITE_SECONDS:
+            self.write(self.pending, force=True)
+
+    def stage(self, stage: str) -> None:
+        if self.current:
+            self.current["stage"] = stage
+            self.write(self.pending, force=True)
+
     def finish(self, entry: dict, seconds: float, footage_seconds: float, device: str,
-               alerted: bool, pending: list[dict]) -> None:
+               alerted: bool, pending: list[dict], result: dict | None = None) -> None:
         self.processed_total += 1
+        if alerted and not entry.get("demo"):
+            self.alerts_total += 1
+            self.last_alert_ts = int(time.time())
         self.recent.append({
             "name": entry["name"], "camera": entry["camera"],
             "captured_ts": entry["captured_ts"], "source": entry["source"],
             "seconds": round(seconds, 1), "footage_seconds": round(footage_seconds, 1),
             "device": device, "alert": alerted, "finished_ts": int(time.time()),
+            "demo": bool(entry.get("demo")), "result": result,
         })
         self.current = None
         self.write(pending, force=True)
@@ -792,9 +854,11 @@ class PipelineStatus:
 
     def write(self, pending: list[dict], force: bool = False) -> None:
         now = time.time()
-        if not force and now - self.last_written < self.IDLE_WRITE_SECONDS:
+        idle_interval = self.PROGRESS_WRITE_SECONDS if self.demo and self.demo.active else self.IDLE_WRITE_SECONDS
+        if not force and now - self.last_written < idle_interval:
             return
         self.last_written = now
+        self.pending = pending
 
         by_camera = self.seconds_by_camera()
         overall = (sum(clip["seconds"] for clip in self.recent) / len(self.recent)) if self.recent else None
@@ -810,7 +874,8 @@ class PipelineStatus:
             "pid": os.getpid(),
             "ts": int(now),
             "started_ts": self.started_ts,
-            "state": "processing" if current else ("queued" if pending else "idle"),
+            "state": ("processing" if current else "correlating" if self.correlating
+                      else "queued" if pending else "idle"),
             "device": self.detectors.device,
             "has_gpu": self.detectors.has_gpu,
             "gpu_failures": self.detectors.gpu_failures,
@@ -831,6 +896,11 @@ class PipelineStatus:
             "processed_total": self.processed_total,
             "errors_total": self.errors_total,
             "last_error": self.last_error,
+            "alerts_total": self.alerts_total,
+            "last_alert_ts": self.last_alert_ts,
+            "last_correlation_ts": self.last_correlation_ts,
+            "last_correlation_raised": self.last_correlation_raised,
+            "demo": self.demo.summary(now) if self.demo else None,
         }
         try:
             write_heartbeat(payload, STATUS_PATH)
@@ -838,12 +908,149 @@ class PipelineStatus:
             print(f"[⚙️ processor] status write failed: {error}", flush=True)
 
 
-def process_clip(connection, detectors: Detectors, mp4filefrominbox: Path):
+class DemoFeed:
+    """
+    Replays the NATIX clips through the live processor, for the dashboard's
+    demo button.
+
+    The clips are read where they already sit (DEMO_CLIPS_DIR, the
+    natix-stray rescue) - nothing is copied into inbox/ - and a demo clip's
+    results are shown in the queue card only: no alert, plate, face, GIF or
+    correlation row is written, so the demo cannot plant duplicate alerts or
+    a "Stranger #3" in the real data. Real clips in inbox/ always go first.
+
+    "realtime" releases one capture-minute's clips every 60 s, the way they
+    would arrive from the car; "backlog" releases them all at once.
+    """
+
+    RELEASE_INTERVAL_SECONDS = 60
+
+    def __init__(self, clips_dir: Path, mode: str, now: float | None = None) -> None:
+        self.mode = mode if mode in ("realtime", "backlog") else "realtime"
+        self.started_ts = time.time() if now is None else now
+        self.finished_ts: float | None = None
+        self.stopped = False
+        self.done: dict[str, float] = {}          # name -> finished time
+        self.entries: list[dict] = []
+
+        minutes: dict[int, list[dict]] = {}
+        for clip in sorted(clips_dir.rglob("*.mp4")) if clips_dir.exists() else []:
+            metadata = parse_clip_filename(clip.name)
+            if metadata["captured_ts"] is None:
+                continue
+            minutes.setdefault(metadata["captured_ts"], []).append({
+                "path": clip, "name": clip.name, "camera": metadata["camera"],
+                "captured_ts": metadata["captured_ts"],
+                "source": detect_clip_source(clip), "demo": True,
+            })
+        for index, captured in enumerate(sorted(minutes)):
+            delay = index * self.RELEASE_INTERVAL_SECONDS if self.mode == "realtime" else 0
+            for entry in minutes[captured]:
+                entry["release_ts"] = self.started_ts + delay
+                self.entries.append(entry)
+
+    @property
+    def active(self) -> bool:
+        return not self.stopped and self.finished_ts is None and bool(self.entries)
+
+    def pending(self, now: float | None = None) -> list[dict]:
+        if not self.active:
+            return []
+        now = time.time() if now is None else now
+        waiting = [entry for entry in self.entries
+                   if entry["release_ts"] <= now and entry["name"] not in self.done]
+        from src.clipqueue import _priority
+        return sorted(waiting, key=_priority)
+
+    def mark_done(self, entry: dict, now: float | None = None) -> None:
+        now = time.time() if now is None else now
+        self.done[entry["name"]] = now
+        if len(self.done) >= len(self.entries):
+            self.finished_ts = now
+
+    def summary(self, now: float) -> dict:
+        released = [entry for entry in self.entries if entry["release_ts"] <= now]
+        upcoming = [entry["release_ts"] for entry in self.entries if entry["release_ts"] > now]
+        # "Lag" as the car would see it: from the moment a clip became
+        # available to the moment its analysis finished.
+        lags = [self.done[entry["name"]] - entry["release_ts"]
+                for entry in self.entries if entry["name"] in self.done]
+        return {
+            "mode": self.mode,
+            "active": self.active,
+            "stopped": self.stopped,
+            "started_ts": int(self.started_ts),
+            "finished_ts": int(self.finished_ts) if self.finished_ts else None,
+            "total": len(self.entries),
+            "released": len(released),
+            "done": len(self.done),
+            "next_release_in": int(min(upcoming) - now) if upcoming and self.active else None,
+            "max_lag_seconds": round(max(lags), 1) if lags else None,
+            "last_lag_seconds": round(lags[-1], 1) if lags else None,
+            "elapsed_seconds": int((self.finished_ts or now) - self.started_ts),
+        }
+
+
+def read_demo_request(current: "DemoFeed | None") -> "DemoFeed | None":
+    """Pick up a start/stop request the dashboard left in jobs/; consume it."""
+    try:
+        request = json.loads(DEMO_REQUEST_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return current
+    try:
+        DEMO_REQUEST_PATH.unlink()
+    except OSError:
+        pass
+    action = request.get("action") if isinstance(request, dict) else None
+    if action == "stop":
+        if current:
+            current.stopped = True
+            print("[⚙️ processor] demo stopped", flush=True)
+        return current
+    if action == "start":
+        demo = DemoFeed(DEMO_CLIPS_DIR, str(request.get("mode") or "realtime"))
+        print(f"[⚙️ processor] demo started: {len(demo.entries)} clips from {DEMO_CLIPS_DIR} "
+              f"({demo.mode})", flush=True)
+        return demo
+    return current
+
+
+def process_demo_clip(detectors: Detectors, entry: dict, status: "PipelineStatus") -> tuple[bool, str, dict]:
+    """Analyse one demo clip for real, but keep only a summary and a snapshot."""
+    clip = entry["path"]
+    analysis, device = detectors.analyze(clip, progress=status.progress)
+    status.stage("saving")
+    snapshot = None
+    if analysis.best_frame is not None:
+        DEMO_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+        snapshot = f"demo/{clip.stem}.jpg"
+        cv2.imwrite(str(MEDIA_DIR / snapshot), analysis.best_frame,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    from src.alpr import vote_on_plate_text
+    plate = vote_on_plate_text(analysis.plate_candidates) if analysis.plate_candidates else None
+    result = {
+        "vehicles": analysis.vehicle_count,
+        "people": analysis.person_count,
+        "plate": getattr(plate, "text", plate) if plate else None,
+        "plate_reads": len(analysis.plate_candidates),
+        "faces": len(analysis.face_observations),
+        "best_score": round(analysis.best_score, 2),
+        "snapshot": snapshot,
+    }
+    alerted = len(analysis.hits) >= MIN_HITS_PER_CLIP and analysis.best_frame is not None
+    return alerted, device, result
+
+
+def process_clip(connection, detectors: Detectors, mp4filefrominbox: Path,
+                 status: "PipelineStatus | None" = None):
     """Analyse one inbox clip and persist everything it produced. Returns (alerted, device)."""
     clip_id = register_clip(connection, mp4filefrominbox)
     context = build_clip_context(connection, clip_id, mp4filefrominbox)
 
-    analysis, device = detectors.analyze(mp4filefrominbox)
+    analysis, device = detectors.analyze(mp4filefrominbox,
+                                         progress=status.progress if status else None)
+    if status:
+        status.stage("saving")
     face_engine = detectors.face_engine
 
     plate_text = record_plate_detections(connection, analysis, context)
@@ -918,7 +1125,8 @@ def process_clip(connection, detectors: Detectors, mp4filefrominbox: Path):
     return alerted, device
 
 
-def run_correlation(connection) -> None:
+def run_correlation(connection) -> int:
+    newly_raised = []
     try:
         from src.correlate import run_correlation_pass
         newly_raised = run_correlation_pass(connection)
@@ -930,6 +1138,7 @@ def run_correlation(connection) -> None:
                 notify_correlation(connection, result)
     except Exception as exception_object:
         print(f"[🧭 correlate] ⧱❗️ ERROR: {exception_object}")
+    return len(newly_raised)
 
 
 def main():
@@ -981,10 +1190,36 @@ def main():
 
         # --- 2) Processing step: ONE clip, the highest-priority one ---
         # The queue is re-read after every clip so new arrivals jump ahead of
-        # any backlog; see clipqueue.py for the order.
+        # any backlog; see clipqueue.py for the order. Real clips always go
+        # before the dashboard's demo replay.
+        status.demo = read_demo_request(status.demo)
+        demo = status.demo
         entries = queue_entries(INBOX_DIR)
+        demo_entries = demo.pending() if demo else []
+
+        def waiting() -> list[dict]:
+            return queue_entries(INBOX_DIR) + (demo.pending() if demo else [])
+
+        if not entries and demo_entries:
+            entry = demo_entries[0]
+            status.begin(entry, demo_entries[1:])
+            started = time.monotonic()
+            try:
+                print(f"[⚙️ processor] demo: {describe_clip(entry['name'])} "
+                      f"(queue {len(demo_entries) - 1})", flush=True)
+                footage_seconds = clip_duration_seconds(entry["path"])
+                alerted, device, result = process_demo_clip(detectors, entry, status)
+                demo.mark_done(entry)
+                status.finish(entry, time.monotonic() - started, footage_seconds, device,
+                              alerted, waiting(), result=result)
+            except Exception as exception_object:
+                print(f"[⚙️ processor] ⧱❗️ demo ERROR {entry['name']}: {exception_object}")
+                demo.mark_done(entry)
+                status.fail(entry, str(exception_object), waiting())
+            continue
+
         if entries:
-            entry, pending = entries[0], entries[1:]
+            entry, pending = entries[0], entries[1:] + demo_entries
             mp4filefrominbox = entry["path"]
             status.begin(entry, pending)
             started = time.monotonic()
@@ -993,9 +1228,9 @@ def main():
                       f"{' [' + entry['source'] + ']' if entry['source'] else ''}"
                       f" (queue {len(pending)})")
                 footage_seconds = clip_duration_seconds(mp4filefrominbox)
-                alerted, device = process_clip(connection, detectors, mp4filefrominbox)
+                alerted, device = process_clip(connection, detectors, mp4filefrominbox, status)
                 status.finish(entry, time.monotonic() - started, footage_seconds, device,
-                              alerted, queue_entries(INBOX_DIR))
+                              alerted, waiting())
             except Exception as exception_object:
                 print(f"[⚙️ processor] ⧱❗️ ERROR {mp4filefrominbox.name}: {exception_object}")
                 # Move aside to avoid infinite loop on a bad file.
@@ -1005,7 +1240,7 @@ def main():
                 except Exception:
                     pass
                 discard_source(mp4filefrominbox)
-                status.fail(entry, str(exception_object), queue_entries(INBOX_DIR))
+                status.fail(entry, str(exception_object), waiting())
             uncorrelated += 1
 
         # --- 3) Correlate: re-score identities, notify on new findings ---
@@ -1014,12 +1249,16 @@ def main():
         if uncorrelated and ENABLE_CORRELATION and (
             len(entries) <= 1 or time.monotonic() - last_correlation >= 60
         ):
-            run_correlation(connection)
+            status.correlating = True
+            status.write(waiting(), force=True)
+            status.last_correlation_raised = run_correlation(connection)
+            status.last_correlation_ts = int(time.time())
+            status.correlating = False
             uncorrelated = 0
             last_correlation = time.monotonic()
 
         if not entries:
-            status.write([])
+            status.write(waiting())
             time.sleep(1.0)
 
 

@@ -210,7 +210,7 @@ def test_a_gpu_failure_reruns_the_clip_on_the_cpu_and_rests_the_gpu():
         return
     calls = []
 
-    def fake_analyze(model, clip, plate_reader=None, face_engine=None, device=None):
+    def fake_analyze(model, clip, plate_reader=None, face_engine=None, device=None, progress=None):
         calls.append(device)
         if device is None:
             raise RuntimeError("CUDA error: CUBLAS_STATUS_ALLOC_FAILED when calling `cublasCreate(handle)`")
@@ -244,6 +244,64 @@ def test_an_ordinary_error_is_not_mistaken_for_a_gpu_failure():
     assert processor.is_gpu_failure(RuntimeError(
         'NVML_SUCCESS == r INTERNAL ASSERT FAILED at "CUDACachingAllocator.cpp"'))
     assert not processor.is_gpu_failure(ValueError("moov atom not found"))
+
+
+# ---------------------------------------------------------------------------
+# Demo feed (needs the processor image)
+# ---------------------------------------------------------------------------
+def demo_clips() -> Path:
+    root = Path(tempfile.mkdtemp(prefix="natix-"))
+    for minute in ("2026-02-16_21-31-48", "2026-02-16_21-32-22", "2026-02-16_21-33-22"):
+        event = root / "TeslaCam" / "SentryClips" / minute
+        event.mkdir(parents=True)
+        for camera in ("front", "back"):
+            (event / f"{minute}-{camera}.mp4").write_bytes(b"")
+    return root
+
+
+def test_the_realtime_demo_releases_one_minute_per_minute():
+    try:
+        from src.processor import DemoFeed
+    except ImportError as error:
+        print(f"  skip  (no processor dependencies here: {error})")
+        return
+    feed = DemoFeed(demo_clips(), "realtime", now=1000.0)
+    assert len(feed.entries) == 6
+    first = feed.pending(now=1000.0)
+    assert [entry["name"] for entry in first] == [
+        "2026-02-16_21-31-48-front.mp4", "2026-02-16_21-31-48-back.mp4"], first
+    assert len(feed.pending(now=1059.0)) == 2          # minute two not yet
+    assert len(feed.pending(now=1061.0)) == 4
+    # Within what has arrived, the newest minute goes first - as in the car.
+    assert feed.pending(now=1061.0)[0]["name"] == "2026-02-16_21-32-22-front.mp4"
+    assert all(entry["demo"] for entry in feed.entries)
+
+
+def test_the_demo_reports_its_worst_wait_and_finishes():
+    try:
+        from src.processor import DemoFeed
+    except ImportError as error:
+        print(f"  skip  (no processor dependencies here: {error})")
+        return
+    feed = DemoFeed(demo_clips(), "backlog", now=1000.0)
+    assert len(feed.pending(now=1000.0)) == 6           # everything at once
+    for offset, entry in enumerate(feed.pending(now=1000.0), start=1):
+        feed.mark_done(entry, now=1000.0 + 10 * offset)
+    summary = feed.summary(1100.0)
+    assert summary["done"] == 6 and not summary["active"], summary
+    assert summary["max_lag_seconds"] == 60.0, summary
+    assert feed.pending(now=1100.0) == []
+
+
+def test_a_stopped_demo_releases_nothing_more():
+    try:
+        from src.processor import DemoFeed
+    except ImportError as error:
+        print(f"  skip  (no processor dependencies here: {error})")
+        return
+    feed = DemoFeed(demo_clips(), "realtime", now=1000.0)
+    feed.stopped = True
+    assert feed.pending(now=5000.0) == [] and not feed.active
 
 
 # ---------------------------------------------------------------------------

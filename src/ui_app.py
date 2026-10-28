@@ -54,6 +54,7 @@ from fastapi import Response
 from src import cfaccess
 from fastapi.responses import PlainTextResponse
 from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse
 
 from src.common import (
     BASE_DIR,
@@ -479,6 +480,53 @@ PAGE_STYLES = """
   footer.sysbar .metric.good b { color:var(--low); }
   footer.sysbar .inner + .inner { margin-top:6px; }
   .pipeline-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:14px; }
+  .pipe-head { display:flex; justify-content:space-between; align-items:center; gap:10px;
+               flex-wrap:wrap; margin-bottom:12px; }
+  .demo-buttons { display:flex; gap:6px; flex-wrap:wrap; }
+  .demo-buttons .btn { cursor:pointer; font:inherit; font-size:12px; padding:6px 10px; }
+  .demo-banner { background:rgba(122,162,255,0.10); border:1px solid rgba(122,162,255,0.35);
+                 border-radius:10px; padding:8px 12px; margin-bottom:12px; font-size:13px; }
+  .flow { display:flex; align-items:stretch; gap:6px; margin-bottom:16px; }
+  .flow .node { background:var(--panel-2); border:1px solid var(--line); border-radius:12px;
+                padding:10px 12px; min-width:0; flex:1 1 0; transition:border-color .3s; }
+  .flow .node.wide { flex:2.6 1 0; }
+  .flow .outs { display:flex; flex-direction:column; gap:6px; flex:1.1 1 0; min-width:0; }
+  .flow .outs .node { flex:1 1 auto; padding:7px 10px; }
+  .flow .arrow { display:flex; align-items:center; color:var(--muted); font-size:18px; flex:0 0 auto; }
+  .node .nh { display:flex; align-items:center; gap:7px; font-size:12px; font-weight:700;
+              text-transform:uppercase; letter-spacing:.05em; color:var(--muted); margin-bottom:6px; }
+  .node .nv { font-size:20px; font-weight:800; font-variant-numeric:tabular-nums; }
+  .node .ns { font-size:12px; color:var(--muted); margin-top:3px; overflow-wrap:anywhere; }
+  .node .dot { width:9px; height:9px; border-radius:50%; background:var(--line); flex:0 0 auto; }
+  .node.ok   { border-color:rgba(74,208,122,0.45); }   .node.ok .dot   { background:var(--low); }
+  .node.warn { border-color:rgba(255,176,32,0.55); }   .node.warn .dot { background:var(--medium); }
+  .node.bad  { border-color:rgba(255,92,92,0.6); }     .node.bad .dot  { background:var(--high); }
+  .node.active { border-color:var(--accent); }
+  .node.active .dot { background:var(--accent); animation:pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { box-shadow:0 0 0 0 rgba(122,162,255,.7); }
+                     50% { box-shadow:0 0 0 5px rgba(122,162,255,0); } }
+  @media (prefers-reduced-motion: reduce) { .node.active .dot { animation:none; } }
+  .states { display:flex; flex-wrap:wrap; gap:4px; margin-bottom:8px; }
+  .states span { font-size:11px; padding:2px 8px; border-radius:999px; border:1px solid var(--line);
+                 color:var(--muted); }
+  .states span.on { background:var(--accent); border-color:var(--accent); color:#0b0b0f; font-weight:700; }
+  .states span.on.bad { background:var(--high); border-color:var(--high); }
+  .states span.on.warn { background:var(--medium); border-color:var(--medium); }
+  .steps { display:grid; grid-template-columns:repeat(4,1fr); gap:4px; margin:8px 0 6px; }
+  .steps div { border:1px solid var(--line); border-radius:8px; padding:5px 6px; text-align:center; }
+  .steps b { display:block; font-size:11px; font-weight:700; }
+  .steps small { display:block; font-size:11px; color:var(--muted); font-variant-numeric:tabular-nums; }
+  .steps div.done { border-color:rgba(74,208,122,0.45); }
+  .steps div.now { border-color:var(--accent); background:rgba(122,162,255,0.12); }
+  .bar { height:5px; background:var(--line); border-radius:3px; overflow:hidden; }
+  .bar div { height:100%; width:0; background:var(--accent); transition:width .8s linear; }
+  @media (max-width: 900px) {
+    .flow { flex-direction:column; }
+    .flow .arrow { justify-content:center; transform:rotate(90deg); height:14px; }
+    .flow .node.wide, .flow .node, .flow .outs { flex:1 1 auto; }
+    .flow .outs { flex-direction:row; flex-wrap:wrap; }
+    .flow .outs .node { flex:1 1 140px; }
+  }
   .pipeline-grid table td { padding:5px 8px; font-size:13px; }
 """
 
@@ -646,7 +694,7 @@ def _read_json(path: Path) -> dict[str, Any] | None:
 
 
 def pipeline_status() -> dict[str, Any]:
-    from src.common import INBOX_DIR, LOGS_DIR
+    from src.common import GIF_QUEUE_DIR, INBOX_DIR, LOGS_DIR
     from src import clipqueue
 
     now = time.time()
@@ -654,12 +702,21 @@ def pipeline_status() -> dict[str, Any]:
     ingest = _read_json(LOGS_DIR / "ingest.json")
 
     # The queue is read live from inbox/ rather than taken from the
-    # heartbeat: it is what is actually waiting, even mid-clip.
+    # heartbeat: it is what is actually waiting, even mid-clip. A running
+    # demo's clips exist only in the processor, so during a demo the
+    # processor's own view (rewritten every second then) is used instead.
     entries = clipqueue.queue_entries(INBOX_DIR)
     current_name = ((beat or {}).get("current") or {}).get("name")
     pending = [entry for entry in entries if entry["name"] != current_name]
+    demo = (beat or {}).get("demo")
 
     result: dict[str, Any] = {"ts": int(now), "queue": clipqueue.summarize(pending, now)}
+    if demo and demo.get("active") and isinstance((beat or {}).get("queue"), dict):
+        result["queue"] = beat["queue"]
+    try:
+        result["gif_queue"] = sum(1 for _ in GIF_QUEUE_DIR.glob("*.json"))
+    except OSError:
+        result["gif_queue"] = None
 
     if beat is None:
         result.update(state="unknown", detail="the processor has not reported yet")
@@ -675,18 +732,24 @@ def pipeline_status() -> dict[str, Any]:
             state, detail = "down", f"no heartbeat for {int(age)}s"
         elif current:
             state, detail = "processing", None
+        elif beat.get("state") == "correlating" and age <= PIPELINE_IDLE_STALE_SECONDS:
+            state, detail = "correlating", None
         else:
-            state, detail = ("queued", "waiting for the next pass") if pending else ("idle", None)
+            state, detail = ("queued", "waiting for the next pass") if result["queue"]["depth"] else ("idle", None)
         by_camera = beat.get("seconds_by_camera") or {}
         overall = (sum(by_camera.values()) / len(by_camera)) if by_camera else None
+        queued_now = (result["queue"].get("next") or []) if demo and demo.get("active") else pending
         result.update(
             state=state, detail=detail, heartbeat_age_seconds=int(age),
             current=current,
-            eta_seconds=clipqueue.estimate_seconds(pending, by_camera, overall),
+            eta_seconds=(beat.get("eta_seconds") if demo and demo.get("active")
+                         else clipqueue.estimate_seconds(queued_now, by_camera, overall)),
             **{key: beat.get(key) for key in (
                 "device", "has_gpu", "gpu_failures", "cpu_fallbacks", "gpu_retry_after",
                 "last_gpu_error", "realtime_factor", "seconds_by_camera", "last", "recent",
                 "processed_total", "errors_total", "last_error", "started_ts",
+                "alerts_total", "last_alert_ts", "last_correlation_ts", "last_correlation_raised",
+                "demo",
             )},
         )
 
@@ -821,20 +884,177 @@ SYSBAR_SCRIPT = """
     putPipe("pingest", ingest.state === "ready" ? "copying" : (ingest.state || "?"),
             ingest.state === "ready" ? "good" : "", ingest.reason || "");
 
-    if (!card) return;
+    if (card) renderFlow(p, q);
+  }
+
+  // ---- The flow diagram on the Recent page --------------------------------
+  function setNode(id, cls, value, sub) {
+    const node = document.getElementById(id);
+    if (!node) return;
+    node.className = "node" + (node.classList.contains("wide") ? " wide" : "") + (cls ? " " + cls : "");
+    const nv = node.querySelector(".nv"), ns = node.querySelector(".ns");
+    if (nv && value != null) nv.textContent = value;
+    if (ns && sub != null) ns.textContent = sub;
+  }
+  function since(ts) { return ts ? ago(Date.now() / 1000 - ts) : "never"; }
+  const INGEST_VIEW = {
+    exported: ["ok", "Recording", "the car owns the drive; clips are copied when it is released"],
+    ready: ["active", "Mounted", "drive readable, ingest copying"],
+    absent: ["", "Not connected", "car not plugged in, or drive not mounted"],
+  };
+
+  function renderFlow(p, q) {
+    const demo = p.demo && p.demo.active ? p.demo : null;
+    const ingest = p.ingest || {};
+
+    // Car drive (or the demo feed standing in for it)
+    if (demo) {
+      setNode("n-car", "active", "NATIX demo",
+        demo.released + "/" + demo.total + " clips released" +
+        (demo.next_release_in != null ? " · next minute in " + demo.next_release_in + "s" : ""));
+    } else {
+      const view = INGEST_VIEW[ingest.state] || ["warn", ingest.state || "unknown", ingest.reason || ""];
+      setNode("n-car", view[0], view[1], view[2]);
+    }
+
+    // Ingest
+    const ingestStale = ingest.age_seconds != null && ingest.age_seconds > 120;
+    setNode("n-ingest",
+      ingest.state === "unknown" || ingestStale ? "bad" : ingest.state === "ready" ? "active" : "",
+      (ingest.copied_total || 0) + " copied",
+      ingestStale ? "no heartbeat for " + duration(ingest.age_seconds)
+                  : ingest.last_copied ? "last: " + ingest.last_copied : "nothing copied since it started");
+
+    // Queue
+    const eta = q.depth === 0 ? "empty" : p.eta_seconds != null ? "clears in ~" + duration(Math.max(60, p.eta_seconds)) : "";
+    setNode("n-queue", q.depth > 30 ? "bad" : q.depth > 6 ? "warn" : q.depth ? "active" : "ok",
+      String(q.depth),
+      [q.events ? q.events + " events" : "", q.demo ? q.demo + " demo" : "", eta].filter(Boolean).join(" · "));
+
+    // Processor: state machine, current clip, step tracker
+    const resting = p.gpu_retry_after && p.gpu_retry_after * 1000 > Date.now();
+    const machine = (p.state === "down" || p.state === "stuck") ? "down"
+                  : (p.state === "processing" && p.current && p.current.device === "cpu" && p.has_gpu) ? "fallback"
+                  : p.state;
+    for (const chip of document.querySelectorAll("#proc-states span")) {
+      const on = chip.dataset.s === machine;
+      chip.className = on ? "on" + (machine === "down" ? " bad" : machine === "fallback" ? " warn" : "") : "";
+    }
+    setNode("n-proc", machine === "down" ? "bad" : machine === "fallback" ? "warn"
+                     : (machine === "processing" || machine === "correlating") ? "active" : "ok");
+    document.getElementById("proc-device").textContent =
+      (p.device === "cuda" ? "GPU" : p.has_gpu ? "CPU · GPU resting" : "CPU") +
+      (p.realtime_factor != null ? " · " + p.realtime_factor.toFixed(2) + "× real time" : "");
+
+    const c = p.current;
+    const order = ["detect", "plates", "faces", "saving"];
+    const stepText = {
+      detect: c ? c.frames_done + "/" + c.frames_budget + " frames" : "–",
+      plates: c ? (c.plate_budget ? c.plate_frames + "/" + c.plate_budget : "off") : "–",
+      faces: c ? (c.face_budget ? c.face_frames + "/" + c.face_budget : "off") : "–",
+      saving: c ? (c.demo ? "summary only" : "alerts, GIF") : "–",
+    };
+    const nowIndex = c ? order.indexOf(c.stage) : -1;
+    for (const box of document.querySelectorAll("#proc-steps > div")) {
+      const index = order.indexOf(box.dataset.step);
+      // Plates and faces run inside the frame loop, so "done" is by count.
+      const finished = c && (box.dataset.step === "detect" ? c.frames_done >= c.frames_budget || nowIndex === 3
+                           : box.dataset.step === "saving" ? false : nowIndex === 3);
+      box.className = c && index === nowIndex ? "now" : finished ? "done" : "";
+      box.querySelector("small").textContent = stepText[box.dataset.step];
+    }
+    document.getElementById("proc-bar").style.width =
+      c ? Math.min(100, Math.round(100 * (c.stage === "saving" ? 1 : c.frames_done / (c.frames_budget || 1)))) + "%" : "0%";
+    document.getElementById("proc-clip").textContent = c
+      ? (c.demo ? "DEMO · " : "") + cameraLabel(c.camera) + " " + clipTime(c.captured_ts) +
+        (c.source ? " · " + c.source.replace("Clips", "") : "") + " · " + Math.round(c.elapsed_seconds) + "s" +
+        " · " + c.vehicles + " vehicle / " + c.people + " person hits"
+      : p.state === "correlating" ? "re-scoring identities…" : (p.detail || "waiting for clips");
+    document.getElementById("proc-foot").textContent =
+      (p.processed_total || 0) + " clips since start" +
+      (p.cpu_fallbacks ? " · " + p.cpu_fallbacks + " on CPU fallback" : "") +
+      (p.errors_total ? " · " + p.errors_total + " errors" : "") +
+      (resting && p.last_gpu_error ? " · GPU: " + p.last_gpu_error : "");
+
+    // Outputs
+    setNode("n-gif", p.gif_queue ? "active" : "ok", null,
+      p.gif_queue ? p.gif_queue + " GIF" + (p.gif_queue === 1 ? "" : "s") + " rendering" : "idle");
+    setNode("n-corr", p.state === "correlating" ? "active" : p.last_correlation_raised ? "warn" : "ok", null,
+      p.state === "correlating" ? "running…" : "last run " + since(p.last_correlation_ts) +
+      (p.last_correlation_raised ? " · " + p.last_correlation_raised + " new finding(s)" : ""));
+    setNode("n-alerts", p.alerts_total ? "warn" : "ok", null,
+      (p.alerts_total || 0) + " since start · last " + since(p.last_alert_ts));
+
+    // Headline, demo banner and buttons
     const headline = document.getElementById("pipeline-headline");
     headline.textContent = q.depth === 0
-      ? "Caught up" + (p.last ? " · newest footage analysed " + clipTime(p.last.captured_ts) : "")
+      ? (p.last ? "Caught up · newest footage analysed " + clipTime(p.last.captured_ts) : "Caught up")
       : q.depth + " waiting" + (p.eta_seconds != null ? ", clears in ~" + duration(Math.max(60, p.eta_seconds)) : "");
+    const banner = document.getElementById("demo-banner");
+    const d = p.demo;
+    if (d && (d.active || d.finished_ts || d.stopped) && Date.now() / 1000 - (d.finished_ts || d.started_ts) < 3600) {
+      banner.hidden = false;
+      const lag = d.max_lag_seconds != null ? " · worst wait from arrival to result " + Math.round(d.max_lag_seconds) + "s" : "";
+      banner.textContent = d.active
+        ? "Demo (" + d.mode + "): " + d.done + "/" + d.total + " clips analysed in " + duration(d.elapsed_seconds) + lag +
+          ". Nothing is saved: results appear below only."
+        : (d.stopped ? "Demo stopped: " : "Demo finished: ") + d.done + "/" + d.total + " clips in " +
+          duration(d.elapsed_seconds) + lag + (d.mode === "realtime" && d.max_lag_seconds != null
+            ? (d.max_lag_seconds < 60 ? " — kept up with the car." : " — fell behind the car.") : "");
+    } else {
+      banner.hidden = true;
+    }
+    for (const button of document.querySelectorAll("[data-demo]")) {
+      button.hidden = (button.dataset.demo === "stop") !== Boolean(demo);
+    }
+
     fill(document.getElementById("pipeline-next"), (q.next || []).map((clip) => row([
       [clipTime(clip.captured_ts)], [cameraLabel(clip.camera)],
-      [clip.source ? clip.source.replace("Clips", "") : "", clip.source && clip.source !== "RecentClips" ? "pill medium" : "muted"],
+      [clip.demo ? "demo" : clip.source ? clip.source.replace("Clips", "") : "",
+       clip.demo ? "pill low" : clip.source && clip.source !== "RecentClips" ? "pill medium" : "muted"],
     ])), "Nothing waiting");
-    fill(document.getElementById("pipeline-recent"), (p.recent || []).map((clip) => row([
-      [clipTime(clip.captured_ts)], [cameraLabel(clip.camera)],
-      [clip.seconds + "s " + (clip.device === "cuda" ? "GPU" : "CPU"), clip.device === "cuda" ? "" : "muted"],
-      [clip.alert ? "alert" : "", clip.alert ? "pill high" : ""],
-    ])), "Nothing yet since the processor started");
+    fill(document.getElementById("pipeline-recent"), (p.recent || []).map((clip) => {
+      const r = clip.result;
+      const found = r ? r.vehicles + " veh · " + r.people + " ppl" + (r.plate ? " · " + r.plate : "") +
+                        (r.faces ? " · " + r.faces + " face" + (r.faces === 1 ? "" : "s") : "") : "";
+      const tr = row([
+        [clipTime(clip.captured_ts)], [cameraLabel(clip.camera)],
+        [clip.seconds + "s " + (clip.device === "cuda" ? "GPU" : "CPU"), clip.device === "cuda" ? "" : "muted"],
+        [found, "muted"],
+        [clip.demo ? "demo" : clip.alert ? "alert" : "", clip.demo ? "pill low" : clip.alert ? "pill high" : ""],
+      ]);
+      if (r && r.snapshot) {
+        const link = document.createElement("a");
+        link.href = URL_ROOT + "/media/" + r.snapshot;
+        link.target = "_blank";
+        link.textContent = "📷";
+        link.title = "best frame from this demo clip";
+        const td = document.createElement("td");
+        td.appendChild(link);
+        tr.appendChild(td);
+      }
+      return tr;
+    }), "Nothing yet since the processor started");
+  }
+
+  for (const button of document.querySelectorAll("[data-demo]")) {
+    button.addEventListener("click", async () => {
+      const action = button.dataset.demo === "stop" ? "stop" : "start";
+      button.disabled = true;
+      try {
+        const response = await fetch(URL_ROOT + "/api/demo", {
+          method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({action: action, mode: action === "start" ? button.dataset.demo : null}),
+        });
+        const answer = await response.json();
+        if (!answer.ok) alert("Demo: " + answer.error);
+      } catch (error) {
+        alert("Demo request failed: " + error);
+      } finally {
+        button.disabled = false;
+        setTimeout(refreshPipeline, 1200);
+      }
+    });
   }
   if (pipe) {
     refreshPipeline();
@@ -942,6 +1162,40 @@ def _list_alerts() -> list[dict[str, Any]]:
 @app.get("/api/pipeline")
 def api_pipeline():
     return pipeline_status()
+
+
+@app.post("/api/demo")
+async def api_demo(request: Request):
+    """
+    Start or stop the NATIX replay. The processor owns the models and the GPU,
+    so this only leaves it a request in jobs/; it picks that up within a second.
+
+    JSON only: a cross-site HTML form cannot send application/json without a
+    CORS preflight this app never answers, so a link on another site cannot
+    start a demo with the viewer's credentials.
+    """
+    from src.common import BASE_DIR, JOBS_DIR
+    if "application/json" not in (request.headers.get("content-type") or ""):
+        return JSONResponse({"ok": False, "error": "expected application/json"}, status_code=415)
+    try:
+        body = await request.json()
+    except ValueError:
+        body = None
+    action = body.get("action") if isinstance(body, dict) else None
+    mode = body.get("mode") if isinstance(body, dict) else None
+    if action not in ("start", "stop") or (action == "start" and mode not in ("realtime", "backlog")):
+        return JSONResponse({"ok": False, "error": "action must be start (mode realtime|backlog) or stop"},
+                            status_code=400)
+    clips_dir = Path(os.environ.get("DEMO_CLIPS_DIR", str(BASE_DIR / "natix-stray")))
+    if action == "start" and not any(clips_dir.rglob("*.mp4")):
+        return JSONResponse({"ok": False, "error": f"no demo clips under {clips_dir}"}, status_code=409)
+    JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    target = JOBS_DIR / "demo.json"
+    temporary = JOBS_DIR / ".demo.json.tmp"
+    temporary.write_text(json.dumps({"action": action, "mode": mode, "ts": int(time.time())}),
+                         encoding="utf-8")
+    os.replace(temporary, target)
+    return {"ok": True, "action": action, "mode": mode}
 
 
 @app.get("/api/system")
@@ -1345,8 +1599,51 @@ def index(limit: int = 25):
       <div class="sub">Newest detections from the TeslaCam feed.</div>
       {banner}
       <div class="card" id="pipeline-card">
-        <div style="font-weight:800; margin-bottom:8px;">Processing queue
-          <span class="muted" id="pipeline-headline" style="font-weight:400; margin-left:8px;"></span></div>
+        <div class="pipe-head">
+          <div><span style="font-weight:800;">Processing pipeline</span>
+            <span class="muted" id="pipeline-headline" style="margin-left:8px;"></span></div>
+          <div class="demo-buttons">
+            <button class="btn" data-demo="realtime" title="Replay the NATIX clips one minute at a time, as the car would deliver them">▶ Real-time demo</button>
+            <button class="btn" data-demo="backlog" title="Drop all NATIX clips in at once and watch the queue drain">⏩ Backlog demo</button>
+            <button class="btn" data-demo="stop" hidden>■ Stop demo</button>
+          </div>
+        </div>
+        <div class="demo-banner" id="demo-banner" hidden></div>
+        <div class="flow">
+          <div class="node" id="n-car"><div class="nh"><span class="dot"></span>Car drive</div>
+            <div class="nv">–</div><div class="ns">–</div></div>
+          <div class="arrow"><span>→</span></div>
+          <div class="node" id="n-ingest"><div class="nh"><span class="dot"></span>Ingest</div>
+            <div class="nv">–</div><div class="ns">–</div></div>
+          <div class="arrow"><span>→</span></div>
+          <div class="node" id="n-queue"><div class="nh"><span class="dot"></span>Queue</div>
+            <div class="nv">–</div><div class="ns">–</div></div>
+          <div class="arrow"><span>→</span></div>
+          <div class="node wide" id="n-proc"><div class="nh"><span class="dot"></span>Processor
+              <span class="muted" id="proc-device" style="margin-left:auto;"></span></div>
+            <div class="states" id="proc-states">
+              <span data-s="idle">Idle</span><span data-s="queued">Waiting</span><span data-s="processing">Processing</span><span data-s="correlating">Correlating</span><span data-s="fallback">CPU fallback</span><span data-s="down">Down</span>
+            </div>
+            <div class="ns" id="proc-clip">–</div>
+            <div class="steps" id="proc-steps">
+              <div data-step="detect"><b>Detect</b><small>–</small></div>
+              <div data-step="plates"><b>Plates</b><small>–</small></div>
+              <div data-step="faces"><b>Faces</b><small>–</small></div>
+              <div data-step="saving"><b>Save</b><small>–</small></div>
+            </div>
+            <div class="bar"><div id="proc-bar"></div></div>
+            <div class="ns" id="proc-foot">–</div>
+          </div>
+          <div class="arrow"><span>→</span></div>
+          <div class="outs">
+            <div class="node" id="n-gif"><div class="nh"><span class="dot"></span>GIF worker</div>
+              <div class="ns">–</div></div>
+            <div class="node" id="n-corr"><div class="nh"><span class="dot"></span>Correlation</div>
+              <div class="ns">–</div></div>
+            <div class="node" id="n-alerts"><div class="nh"><span class="dot"></span>Alerts</div>
+              <div class="ns">–</div></div>
+          </div>
+        </div>
         <div class="pipeline-grid">
           <div><div class="muted" style="margin-bottom:4px;">Up next (Sentry/Saved first, then newest)</div>
             <table><tbody id="pipeline-next"><tr><td class="muted">–</td></tr></tbody></table></div>

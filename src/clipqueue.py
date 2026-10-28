@@ -145,15 +145,18 @@ def summarize(entries: list[dict], now: float | None = None) -> dict:
     """The queue in numbers, for the processor's heartbeat and the dashboard."""
     now = time.time() if now is None else now
     captured = [entry["captured_ts"] for entry in entries if entry["captured_ts"] is not None]
-    events = sum(1 for entry in entries if SOURCE_RANK.get(entry["source"]) == 0)
+    events = sum(1 for entry in entries
+                 if SOURCE_RANK.get(entry["source"]) == 0 and not entry.get("demo"))
     return {
         "depth": len(entries),
         "events": events,
+        "demo": sum(1 for entry in entries if entry.get("demo")),
         "oldest_captured_ts": min(captured) if captured else None,
         "newest_captured_ts": max(captured) if captured else None,
         "next": [
             {"name": entry["name"], "camera": entry["camera"],
-             "captured_ts": entry["captured_ts"], "source": entry["source"]}
+             "captured_ts": entry["captured_ts"], "source": entry["source"],
+             "demo": bool(entry.get("demo"))}
             for entry in entries[:10]
         ],
         "ts": int(now),

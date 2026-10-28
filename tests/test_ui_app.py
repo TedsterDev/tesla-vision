@@ -710,6 +710,71 @@ def test_a_long_clip_reads_as_processing_until_it_is_stuck():
             clip.unlink()
 
 
+def post_json(path: str, payload, content_type: str = "application/json") -> tuple[int, dict]:
+    body = json.dumps(payload).encode()
+    scope = {
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+        "method": "POST", "scheme": "http", "path": path, "raw_path": path.encode(),
+        "query_string": b"", "root_path": "", "server": ("testserver", 80),
+        "client": ("10.0.0.5", 51234),
+        "headers": [(b"content-type", content_type.encode()),
+                    (b"content-length", str(len(body)).encode())],
+    }
+    messages: list[dict] = []
+    sent = False
+
+    async def receive():
+        nonlocal sent
+        if sent:
+            return {"type": "http.disconnect"}
+        sent = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    async def send(message):
+        messages.append(message)
+
+    asyncio.run(ui_app.app(scope, receive, send))
+    start = next(m for m in messages if m["type"] == "http.response.start")
+    data = b"".join(m.get("body", b"") for m in messages if m["type"] == "http.response.body")
+    return start["status"], json.loads(data or b"{}")
+
+
+def test_the_demo_endpoint_refuses_anything_but_json():
+    status, _ = post_json("/api/demo", {"action": "start", "mode": "realtime"}, "text/plain")
+    assert status == 415, status
+    status, _ = post_json("/api/demo", {"action": "explode"})
+    assert status == 400, status
+    status, _ = post_json("/api/demo", {"action": "start", "mode": "sideways"})
+    assert status == 400, status
+
+
+def test_the_demo_endpoint_leaves_the_processor_a_request():
+    from src.common import BASE_DIR, JOBS_DIR
+    stray = BASE_DIR / "natix-stray" / "x" / "TeslaCam" / "SentryClips" / "2026-02-16_21-31-48"
+    request = JOBS_DIR / "demo.json"
+    try:
+        status, answer = post_json("/api/demo", {"action": "start", "mode": "backlog"})
+        assert status == 409, (status, answer)          # nothing to replay yet
+        stray.mkdir(parents=True)
+        (stray / "2026-02-16_21-31-48-front.mp4").write_bytes(b"")
+        status, answer = post_json("/api/demo", {"action": "start", "mode": "backlog"})
+        assert status == 200 and answer["ok"], (status, answer)
+        assert json.loads(request.read_text())["mode"] == "backlog"
+        status, _ = post_json("/api/demo", {"action": "stop"})
+        assert status == 200 and json.loads(request.read_text())["action"] == "stop"
+    finally:
+        request.unlink(missing_ok=True)
+        shutil.rmtree(BASE_DIR / "natix-stray", ignore_errors=True)
+
+
+def test_the_recent_page_has_the_flow_diagram_and_demo_buttons():
+    status, _, body = render("/")
+    assert status == 200, status
+    for marker in ('id="n-car"', 'id="n-proc"', 'id="proc-steps"', 'id="n-alerts"',
+                   'data-demo="realtime"', 'data-demo="backlog"'):
+        assert marker in body, marker
+
+
 # ---------------------------------------------------------------------------
 def main() -> int:
     tests = [
