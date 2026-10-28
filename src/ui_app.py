@@ -483,6 +483,11 @@ PAGE_STYLES = """
   .pipe-head { display:flex; justify-content:space-between; align-items:center; gap:10px;
                flex-wrap:wrap; margin-bottom:12px; }
   .demo-buttons { display:flex; gap:6px; flex-wrap:wrap; }
+  .lag-wrap { display:flex; align-items:center; gap:14px; }
+  .lag { font-size:30px; font-weight:800; font-variant-numeric:tabular-nums; letter-spacing:-0.02em;
+         min-width:4.2em; }
+  .lag.good { color:var(--low); } .lag.warn { color:var(--medium); } .lag.high { color:var(--high); }
+  .lag.off { color:var(--muted); font-size:16px; font-weight:600; }
   .demo-buttons .btn { cursor:pointer; font:inherit; font-size:12px; padding:6px 10px; }
   .demo-banner { background:rgba(122,162,255,0.10); border:1px solid rgba(122,162,255,0.35);
                  border-radius:10px; padding:8px 12px; margin-bottom:12px; font-size:13px; }
@@ -684,6 +689,11 @@ PIPELINE_IDLE_STALE_SECONDS = 60
 # 5 MP clip on the CPU fallback, is a couple of minutes.
 PIPELINE_CLIP_STUCK_SECONDS = 900
 
+# "Behind real time" is only meaningful while footage is arriving. With the
+# car away, now minus the newest analysed footage is just "when did I last
+# drive" - so past this, or with no car volume attached, it is not shown.
+LIVE_EDGE_MAX_AGE_SECONDS = 900
+
 
 def _read_json(path: Path) -> dict[str, Any] | None:
     try:
@@ -761,6 +771,20 @@ def pipeline_status() -> dict[str, Any]:
             "age_seconds": int(now - (ingest.get("last_pass_ts") or 0)),
             "copied_total": ingest.get("copied_total"), "last_copied": ingest.get("last_copied"),
         }
+
+    # "Behind real time": which edge to count from, if any. The page ticks
+    # it every second between fetches, from edge_ts and the server clock.
+    demo_edge = (beat or {}).get("demo_edge_ts")
+    live_edge = (beat or {}).get("live_edge_ts")
+    car_attached = (result.get("ingest") or {}).get("state") in ("exported", "ready")
+    if demo and demo.get("active"):
+        result["lag"] = {"mode": "demo", "edge_ts": demo_edge}
+    elif live_edge and (car_attached or now - live_edge <= LIVE_EDGE_MAX_AGE_SECONDS):
+        result["lag"] = {"mode": "live", "edge_ts": live_edge}
+    elif car_attached:
+        result["lag"] = {"mode": "live", "edge_ts": None}
+    else:
+        result["lag"] = {"mode": "offline", "edge_ts": None}
 
     # Path objects do not serialise; the queue summary only carries names.
     return result
@@ -861,6 +885,10 @@ SYSBAR_SCRIPT = """
       return;
     }
     pipe.style.opacity = 1;
+    // skew: how far this browser's clock is from the Orin's, so the counter
+    // is right even when the phone and the Jetson disagree about the time.
+    lagState = p.lag ? {mode: p.lag.mode, edge_ts: p.lag.edge_ts, skew: Date.now() / 1000 - p.ts} : null;
+    tickLag();
     const q = p.queue || {depth: 0, events: 0, next: []};
     putPipe("pstate", "● " + p.state, STATE_CLASS[p.state] || "", p.detail || "");
     if (p.current) {
@@ -1056,16 +1084,46 @@ SYSBAR_SCRIPT = """
       }
     });
   }
+  // ---- "Behind real time", ticking every second between fetches --------
+  let lagState = null;   // {mode, edge_ts, skew}
+  function lagText(seconds) {
+    seconds = Math.max(0, Math.round(seconds));
+    if (seconds < 100) return "−" + seconds + " s";
+    const m = Math.floor(seconds / 60), s = seconds % 60;
+    if (m < 60) return "−" + m + ":" + String(s).padStart(2, "0");
+    return "−" + duration(seconds);
+  }
+  function tickLag() {
+    const big = document.getElementById("lag-big");
+    const label = document.getElementById("lag-label");
+    let text = "–", cls = "off", note = "behind real time", title = "";
+    if (lagState) {
+      if (lagState.mode === "offline") {
+        text = "no live footage"; note = "car not connected";
+      } else if (lagState.edge_ts == null) {
+        text = "waiting"; note = lagState.mode === "demo" ? "demo: first clip in progress" : "for the first clip";
+      } else {
+        const behind = Date.now() / 1000 - lagState.skew - lagState.edge_ts;
+        text = lagText(behind);
+        cls = behind < 150 ? "good" : behind < 300 ? "warn" : "high";
+        note = lagState.mode === "demo" ? "behind real time (demo clock)" : "behind real time";
+      }
+    }
+    putPipe("pbehind", text, cls === "off" ? "" : cls, note);
+    if (big) { big.textContent = text; big.className = "lag " + cls; }
+    if (label) label.textContent = note;
+  }
   if (pipe) {
     refreshPipeline();
     setInterval(refreshPipeline, 5000);
+    setInterval(tickLag, 1000);
   }
 })();
 </script>
 """
 
 PIPELINE_METRICS = [
-    ("pstate", "Pipeline"), ("pnow", "Now"), ("pqueue", "Queue"), ("peta", "Clears in"),
+    ("pstate", "Pipeline"), ("pbehind", "Behind real time"), ("pnow", "Now"), ("pqueue", "Queue"), ("peta", "Clears in"),
     ("pspeed", "Speed"), ("pfresh", "Newest done"), ("pingest", "Ingest"),
 ]
 
@@ -1600,8 +1658,12 @@ def index(limit: int = 25):
       {banner}
       <div class="card" id="pipeline-card">
         <div class="pipe-head">
-          <div><span style="font-weight:800;">Processing pipeline</span>
-            <span class="muted" id="pipeline-headline" style="margin-left:8px;"></span></div>
+          <div class="lag-wrap">
+            <div class="lag" id="lag-big" title="Now minus the end of the newest footage analysed. It climbs while the car records the current one-minute clip, then drops once that clip is copied and processed: about -15 s to -100 s while driving. Climbing steadily past that means a backlog is building.">–</div>
+            <div><span style="font-weight:800;">Processing pipeline</span><br>
+              <span class="muted" id="lag-label">behind real time</span>
+              <span class="muted" id="pipeline-headline" style="margin-left:8px;"></span></div>
+          </div>
           <div class="demo-buttons">
             <button class="btn" data-demo="realtime" title="Replay the NATIX clips one minute at a time, as the car would deliver them">▶ Real-time demo</button>
             <button class="btn" data-demo="backlog" title="Drop all NATIX clips in at once and watch the queue drain">⏩ Backlog demo</button>

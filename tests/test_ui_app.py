@@ -775,6 +775,36 @@ def test_the_recent_page_has_the_flow_diagram_and_demo_buttons():
         assert marker in body, marker
 
 
+def test_behind_real_time_is_hidden_when_no_footage_is_live():
+    (LOGS_DIR / "processor.json").write_text(json.dumps({
+        "ts": NOW, "current": None, "live_edge_ts": NOW - 86400 * 200,
+    }))
+    (LOGS_DIR / "ingest.json").write_text(json.dumps({"state": "absent", "last_pass_ts": NOW}))
+    try:
+        assert json.loads(render("/api/pipeline")[2])["lag"] == {"mode": "offline", "edge_ts": None}
+        # Recent footage counts as live even before ingest says the car is there.
+        (LOGS_DIR / "processor.json").write_text(json.dumps({
+            "ts": NOW, "current": None, "live_edge_ts": NOW - 70,
+        }))
+        lag = json.loads(render("/api/pipeline")[2])["lag"]
+        assert lag == {"mode": "live", "edge_ts": NOW - 70}, lag
+    finally:
+        (LOGS_DIR / "processor.json").unlink(missing_ok=True)
+        (LOGS_DIR / "ingest.json").unlink(missing_ok=True)
+
+
+def test_a_running_demo_counts_on_its_own_clock():
+    (LOGS_DIR / "processor.json").write_text(json.dumps({
+        "ts": NOW, "current": None, "live_edge_ts": None, "demo_edge_ts": NOW - 30,
+        "demo": {"active": True}, "queue": {"depth": 0, "events": 0, "demo": 0, "next": []},
+    }))
+    try:
+        lag = json.loads(render("/api/pipeline")[2])["lag"]
+        assert lag == {"mode": "demo", "edge_ts": NOW - 30}, lag
+    finally:
+        (LOGS_DIR / "processor.json").unlink(missing_ok=True)
+
+
 # ---------------------------------------------------------------------------
 def main() -> int:
     tests = [

@@ -777,6 +777,12 @@ class PipelineStatus:
         self.last_correlation_ts: int | None = None
         self.last_correlation_raised = 0
         self.demo: "DemoFeed | None" = None
+        # The "live edge": the real-world moment the newest analysed footage
+        # reaches - a clip's capture time plus its length. "Behind real time"
+        # on the dashboard is now minus this. Demo clips keep their own edge,
+        # on the demo's clock: a demo minute "ends" when it is released.
+        self.live_edge_ts: float | None = None
+        self.demo_edge_ts: float | None = None
 
     def begin(self, entry: dict, pending: list[dict]) -> None:
         self.current = {
@@ -815,6 +821,10 @@ class PipelineStatus:
         if alerted and not entry.get("demo"):
             self.alerts_total += 1
             self.last_alert_ts = int(time.time())
+        if entry.get("demo"):
+            self.demo_edge_ts = max(self.demo_edge_ts or 0, entry["release_ts"])
+        elif entry["captured_ts"] is not None:
+            self.live_edge_ts = max(self.live_edge_ts or 0, entry["captured_ts"] + footage_seconds)
         self.recent.append({
             "name": entry["name"], "camera": entry["camera"],
             "captured_ts": entry["captured_ts"], "source": entry["source"],
@@ -901,6 +911,8 @@ class PipelineStatus:
             "last_correlation_ts": self.last_correlation_ts,
             "last_correlation_raised": self.last_correlation_raised,
             "demo": self.demo.summary(now) if self.demo else None,
+            "live_edge_ts": self.live_edge_ts,
+            "demo_edge_ts": self.demo_edge_ts if self.demo and self.demo.active else None,
         }
         try:
             write_heartbeat(payload, STATUS_PATH)
@@ -991,7 +1003,7 @@ class DemoFeed:
         }
 
 
-def read_demo_request(current: "DemoFeed | None") -> "DemoFeed | None":
+def read_demo_request(current: "DemoFeed | None", status: "PipelineStatus | None" = None) -> "DemoFeed | None":
     """Pick up a start/stop request the dashboard left in jobs/; consume it."""
     try:
         request = json.loads(DEMO_REQUEST_PATH.read_text(encoding="utf-8"))
@@ -1009,6 +1021,8 @@ def read_demo_request(current: "DemoFeed | None") -> "DemoFeed | None":
         return current
     if action == "start":
         demo = DemoFeed(DEMO_CLIPS_DIR, str(request.get("mode") or "realtime"))
+        if status:
+            status.demo_edge_ts = None
         print(f"[⚙️ processor] demo started: {len(demo.entries)} clips from {DEMO_CLIPS_DIR} "
               f"({demo.mode})", flush=True)
         return demo
@@ -1192,7 +1206,7 @@ def main():
         # The queue is re-read after every clip so new arrivals jump ahead of
         # any backlog; see clipqueue.py for the order. Real clips always go
         # before the dashboard's demo replay.
-        status.demo = read_demo_request(status.demo)
+        status.demo = read_demo_request(status.demo, status)
         demo = status.demo
         entries = queue_entries(INBOX_DIR)
         demo_entries = demo.pending() if demo else []
