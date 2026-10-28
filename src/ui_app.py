@@ -56,6 +56,7 @@ from fastapi.responses import PlainTextResponse
 from fastapi.responses import RedirectResponse
 
 from src.common import (
+    BASE_DIR,
     MEDIA_DIR,
     ALERTS_DIR,
     ensure_dirs
@@ -466,6 +467,15 @@ PAGE_STYLES = """
   .reason::before { content:"▸ "; color:var(--accent); }
   .reason.alarm { color:var(--high); font-weight:700; }
   .reason.alarm::before { content:"⚠ "; }
+  footer.sysbar { border-top:1px solid var(--line); margin-top:28px; padding:12px 20px 18px;
+                  color:var(--muted); font-size:12px; }
+  footer.sysbar .inner { max-width:1400px; margin:0 auto; display:flex; flex-wrap:wrap;
+                         gap:6px 18px; align-items:center; }
+  footer.sysbar .label { font-weight:700; color:var(--text); margin-right:4px; }
+  footer.sysbar .metric b { color:var(--text); font-weight:600;
+                            font-variant-numeric:tabular-nums; }
+  footer.sysbar .metric.warn b { color:var(--medium); }
+  footer.sysbar .metric.high b { color:var(--high); }
 """
 
 NAV_TABS = [
@@ -481,6 +491,192 @@ NAV_TABS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Orin box monitoring (the footer on every page)
+# ---------------------------------------------------------------------------
+# A container shares the host kernel, so /proc and /sys here describe the whole
+# Jetson, not just this container - which is exactly what the footer wants.
+# Every reader returns None rather than raising: a missing sensor should blank
+# one figure, never take a page down with it.
+
+_cpu_previous_sample: tuple[float, int, int] | None = None   # (monotonic, busy, total)
+
+# Junction temperature is the one the Orin throttles on; the others are fallbacks
+# for boards that name their zones differently.
+_THERMAL_PREFERENCE = ("tj-thermal", "cpu-thermal", "gpu-thermal", "soc0-thermal")
+
+
+def _read_cpu_times() -> tuple[int, int] | None:
+    try:
+        fields = [int(v) for v in Path("/proc/stat").read_text().split("\n", 1)[0].split()[1:]]
+    except (OSError, ValueError):
+        return None
+    idle = fields[3] + (fields[4] if len(fields) > 4 else 0)   # idle + iowait
+    total = sum(fields[:8])                                    # guest is already in user
+    return total - idle, total
+
+
+def _cpu_percent() -> float | None:
+    """Busy share since the previous call; a fresh 200 ms sample if that is stale."""
+    global _cpu_previous_sample
+    now = time.monotonic()
+    current = _read_cpu_times()
+    if current is None:
+        return None
+    previous = _cpu_previous_sample
+    if previous is None or now - previous[0] > 60:
+        time.sleep(0.2)
+        previous = (now, *current)
+        now = time.monotonic()
+        current = _read_cpu_times() or current
+    _cpu_previous_sample = (now, *current)
+    busy_delta, total_delta = current[0] - previous[1], current[1] - previous[2]
+    return round(100 * busy_delta / total_delta, 1) if total_delta > 0 else None
+
+
+def _meminfo() -> dict[str, int]:
+    values: dict[str, int] = {}
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            key, _, rest = line.partition(":")
+            values[key] = int(rest.split()[0]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return values
+
+
+def _read_number(path: str) -> float | None:
+    try:
+        return float(Path(path).read_text().strip())
+    # TypeError: a sysfs read that returns EAGAIN (the idle cv*-thermal zones)
+    # reaches Python 3.10's text decoder as None instead of an OSError.
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _temperature_c() -> tuple[str, float] | None:
+    readings: dict[str, float] = {}
+    for zone in Path("/sys/class/thermal").glob("thermal_zone*"):
+        try:
+            name = (zone / "type").read_text().strip()
+        except OSError:
+            continue
+        millidegrees = _read_number(str(zone / "temp"))
+        if millidegrees is not None and millidegrees > 0:
+            readings[name] = millidegrees / 1000
+    for name in _THERMAL_PREFERENCE:
+        if name in readings:
+            return name.removesuffix("-thermal"), round(readings[name], 1)
+    if readings:
+        name, value = max(readings.items(), key=lambda item: item[1])
+        return name.removesuffix("-thermal"), round(value, 1)
+    return None
+
+
+def system_stats() -> dict[str, Any]:
+    memory = _meminfo()
+    mem_total = memory.get("MemTotal")
+    mem_used = mem_total - memory["MemAvailable"] if mem_total and "MemAvailable" in memory else None
+    swap_total = memory.get("SwapTotal")
+    swap_used = swap_total - memory.get("SwapFree", 0) if swap_total else None
+
+    try:
+        disk = os.statvfs(BASE_DIR)
+        disk_total = disk.f_blocks * disk.f_frsize
+        disk_used = disk_total - disk.f_bavail * disk.f_frsize   # what we can still write
+    except OSError:
+        disk_total = disk_used = None
+
+    try:
+        load = [float(v) for v in Path("/proc/loadavg").read_text().split()[:3]]
+    except (OSError, ValueError):
+        load = None
+
+    gpu_load = _read_number("/sys/devices/platform/gpu.0/load")   # per mille
+    uptime = None
+    try:
+        uptime = float(Path("/proc/uptime").read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        pass
+    temperature = _temperature_c()
+
+    return {
+        "ts": int(time.time()),
+        "cpu_percent": _cpu_percent(),
+        "cpu_count": os.cpu_count(),
+        "load": load,
+        "mem_used": mem_used,
+        "mem_total": mem_total,
+        "swap_used": swap_used,
+        "swap_total": swap_total,
+        "disk_used": disk_used,
+        "disk_total": disk_total,
+        "disk_path": str(BASE_DIR),
+        "gpu_percent": round(gpu_load / 10, 1) if gpu_load is not None else None,
+        "temp_c": temperature[1] if temperature else None,
+        "temp_zone": temperature[0] if temperature else None,
+        "uptime_seconds": uptime,
+    }
+
+
+# Plain string, not an f-string: it is JavaScript, and doubling every brace
+# would make it unreadable. Fills the footer render_page emits and refreshes
+# it every 5 s; a failed fetch leaves the last figures and dims the bar.
+SYSBAR_SCRIPT = """
+<script>
+(function () {
+  const bar = document.getElementById("sysbar");
+  if (!bar) return;
+  const gib = (bytes) => (bytes / 1073741824).toFixed(1);
+  const level = (percent, warn, high) => percent >= high ? "high" : percent >= warn ? "warn" : "";
+  function put(key, text, cls) {
+    const el = bar.querySelector('[data-k="' + key + '"]');
+    if (!el) return;
+    el.className = "metric " + (cls || "");
+    el.querySelector("b").textContent = text;
+  }
+  function pct(used, total) { return total ? 100 * used / total : null; }
+  function duration(seconds) {
+    const d = Math.floor(seconds / 86400), h = Math.floor(seconds % 86400 / 3600),
+          m = Math.floor(seconds % 3600 / 60);
+    return d ? d + "d " + h + "h" : h ? h + "h " + m + "m" : m + "m";
+  }
+  async function refresh() {
+    let s;
+    try {
+      s = await (await fetch(URL_ROOT + "/api/system", {cache: "no-store"})).json();
+    } catch (error) {
+      bar.style.opacity = 0.5;
+      return;
+    }
+    bar.style.opacity = 1;
+    if (s.cpu_percent != null) {
+      const load = s.load ? " · load " + s.load[0].toFixed(2) : "";
+      put("cpu", s.cpu_percent.toFixed(0) + "%" + load, level(s.cpu_percent, 80, 95));
+    }
+    if (s.gpu_percent != null) put("gpu", s.gpu_percent.toFixed(0) + "%", level(s.gpu_percent, 80, 95));
+    const mem = pct(s.mem_used, s.mem_total);
+    if (mem != null) put("mem", gib(s.mem_used) + " / " + gib(s.mem_total) + " GB", level(mem, 80, 92));
+    const swap = pct(s.swap_used, s.swap_total);
+    if (swap != null) put("swap", gib(s.swap_used) + " / " + gib(s.swap_total) + " GB", level(swap, 60, 85));
+    const disk = pct(s.disk_used, s.disk_total);
+    if (disk != null) put("disk", disk.toFixed(0) + "% · " + gib(s.disk_total - s.disk_used) + " GB free",
+                          level(disk, 80, 90));
+    if (s.temp_c != null) put("temp", s.temp_c.toFixed(0) + "°C " + s.temp_zone, level(s.temp_c, 75, 90));
+    if (s.uptime_seconds != null) put("up", duration(s.uptime_seconds));
+  }
+  refresh();
+  setInterval(refresh, 5000);
+})();
+</script>
+"""
+
+SYSBAR_METRICS = [
+    ("cpu", "CPU"), ("gpu", "GPU"), ("mem", "RAM"), ("swap", "Swap"),
+    ("disk", "Disk"), ("temp", "Temp"), ("up", "Up"),
+]
+
+
 def render_page(title: str, body: str, active_path: str = "", head_extra: str = "") -> HTMLResponse:
     """Wrap page content in the shared shell (nav, styles, viewport)."""
     tabs = "".join(
@@ -490,6 +686,10 @@ def render_page(title: str, body: str, active_path: str = "", head_extra: str = 
     # Page scripts that live in plain (non-f) strings build their URLs from
     # this, so it has to be defined before head_extra or the body run.
     url_root_js = json.dumps(URL_ROOT).replace("<", "\\u003c")
+    sysbar = "".join(
+        f'<span class="metric" data-k="{key}">{label} <b>–</b></span>'
+        for key, label in SYSBAR_METRICS
+    )
 
     return HTMLResponse(f"""<!doctype html>
 <html><head>
@@ -506,6 +706,11 @@ def render_page(title: str, body: str, active_path: str = "", head_extra: str = 
     {tabs}
   </nav></header>
   <main>{body}</main>
+  <footer class="sysbar"><div class="inner" id="sysbar">
+    <span class="label">Orin box</span>
+    {sysbar}
+  </div></footer>
+  {SYSBAR_SCRIPT}
 </body></html>""")
 
 
@@ -545,6 +750,11 @@ def _list_alerts() -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # JSON API - mirrors Scout's app/server/routes/api/*
 # ---------------------------------------------------------------------------
+
+@app.get("/api/system")
+def api_system():
+    return system_stats()
+
 
 @app.get("/healthz")
 def healthz():

@@ -627,6 +627,28 @@ def test_every_page_link_carries_the_prefix():
 
 
 # ---------------------------------------------------------------------------
+# Orin box footer
+# ---------------------------------------------------------------------------
+def test_every_page_carries_the_orin_box_footer():
+    for path in ("/", "/findings", "/plates", "/faces", "/timeline", "/natix", "/settings"):
+        status, _, body = render(path)
+        assert status == 200, (path, status)
+        assert 'id="sysbar"' in body, path
+        assert '/api/system' in body, path
+
+
+def test_the_system_endpoint_reports_the_box_and_not_nonsense():
+    status, _, body = render("/api/system")
+    assert status == 200, status
+    stats = json.loads(body)
+    for key in ("mem_used", "mem_total", "disk_used", "disk_total", "cpu_percent"):
+        assert stats[key] is not None, (key, stats)
+    assert 0 < stats["mem_used"] <= stats["mem_total"], stats
+    assert 0 < stats["disk_used"] <= stats["disk_total"], stats
+    assert 0 <= stats["cpu_percent"] <= 100, stats
+
+
+# ---------------------------------------------------------------------------
 def main() -> int:
     tests = [
         value for name, value in sorted(globals().items())
