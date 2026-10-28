@@ -7,6 +7,7 @@ asks for now that it seeks instead of decoding everything.
 
 Run:  python3 tests/test_clipqueue.py
 """
+import json
 import os
 import shutil
 import sys
@@ -302,6 +303,81 @@ def test_a_stopped_demo_releases_nothing_more():
     feed = DemoFeed(demo_clips(), "realtime", now=1000.0)
     feed.stopped = True
     assert feed.pending(now=5000.0) == [] and not feed.active
+
+
+# ---------------------------------------------------------------------------
+# Detection boxes (needs the processor image)
+# ---------------------------------------------------------------------------
+class FakeModel:
+    """Stands in for YOLO: records the frames it is shown, detects nothing."""
+    names = {0: "person", 2: "car"}
+
+    def __init__(self):
+        self.seen = []
+
+    def __call__(self, image, verbose=False, **kwargs):
+        self.seen.append(int(image.mean()))
+        return [type("Result", (), {"boxes": None})()]
+
+
+def test_boxes_are_fractions_of_the_frame():
+    try:
+        from src.processor import normalised_box
+    except ImportError as error:
+        print(f"  skip  (no processor dependencies here: {error})")
+        return
+    box = normalised_box("vehicle", "car", 0.8612, (144.8, 93.8, 724.0, 469.0), 1448, 938)
+    assert box == {"kind": "vehicle", "label": "car", "conf": 0.861, "box": [0.1, 0.1, 0.5, 0.5]}, box
+
+
+def test_the_idle_pass_boxes_exactly_the_frames_the_gif_shows():
+    try:
+        from src import processor
+    except ImportError as error:
+        print(f"  skip  (no processor dependencies here: {error})")
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        clip = Path(tmp) / "clip.mp4"
+        synthetic_clip(clip, 200)          # 30 fps, ~6.7 s: frame value = index % 256
+        original = processor.PROCESSED_DIR
+        processor.PROCESSED_DIR = Path(tmp)
+        try:
+            model = FakeModel()
+            frames = processor.BoxAnnotator()._gif_frames(model, {"source_file": "clip.mp4"})
+        finally:
+            processor.PROCESSED_DIR = original
+        expected = [round(k / processor.GIF_FPS * 30.0) for k in range(processor.GIF_SECONDS * processor.GIF_FPS)]
+        assert len(frames) == len(expected) == 40, (len(frames), len(expected))
+        # ffmpeg's fps filter from t=0: GIF frame k is video frame round(k/8*30).
+        assert all(abs(seen - want) <= 3 for seen, want in zip(model.seen, expected)), list(zip(model.seen, expected))[:8]
+
+
+def test_the_idle_pass_boxes_old_snapshots_from_the_jpeg_itself():
+    try:
+        import cv2
+        import numpy as np
+        from src import processor
+    except ImportError as error:
+        print(f"  skip  (no processor dependencies here: {error})")
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        media, alerts = Path(tmp) / "media", Path(tmp) / "alerts"
+        media.mkdir(); alerts.mkdir()
+        cv2.imwrite(str(media / "abc.jpg"), np.full((48, 64, 3), 90, dtype=np.uint8))
+        (alerts / "abc.json").write_text('{"id": "abc", "jpeg": "abc.jpg", "gif": "abc.gif"}')
+        saved = processor.MEDIA_DIR, processor.ALERTS_DIR
+        processor.MEDIA_DIR, processor.ALERTS_DIR = media, alerts
+        try:
+            annotator = processor.BoxAnnotator()
+            assert annotator.pending() == 1, annotator.todo     # the GIF does not exist: skipped
+            detectors = type("D", (), {"model": FakeModel(), "gpu_retry_after": 0})()
+            assert annotator.annotate_one(detectors) == "abc.jpg"
+            sidecar = json.loads((media / "abc.jpg.boxes.json").read_text())
+            assert sidecar["source"] == "snapshot" and sidecar["frames"] == [[]], sidecar
+            annotator.last_scan = 0
+            assert annotator.pending() == 0
+        finally:
+            processor.MEDIA_DIR, processor.ALERTS_DIR = saved
 
 
 # ---------------------------------------------------------------------------

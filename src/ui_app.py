@@ -786,7 +786,8 @@ ACTIVITY_SCRIPT = """
     const bg = (init && init.tvBackground) || (method === "GET" && seenGets.has(key));
     if (method === "GET") seenGets.add(key);
     const r = {id: nextId++, method, path, url, bg, state: "run", start: performance.now(), wall: Date.now(),
-               after: booted, status: null, ms: null, size: null, server: null};
+               after: booted, status: null, ms: null, size: null, server: null,
+               quiet: Boolean(init && init.tvQuiet)};   // an expected 404 (e.g. no boxes yet)
     log.push(r); if (log.length > 150) log.shift();
     if (!booted) step("f" + r.id, method + " " + path, "requesting…");
     if (!bg) { inflight.add(r); scheduleActivity(); }
@@ -811,7 +812,7 @@ ACTIVITY_SCRIPT = """
         (status ? "HTTP " + status : why || "") + (r.size ? " · " + fmtKB(r.size) : "") +
         (r.server != null ? " · Orin " + fmtMs(r.server) : ""));
     }
-    if (state === "fail" && (r.after || booted) && !(r.bg && why === "cancelled")) flashError(r);
+    if (state === "fail" && !r.quiet && (r.after || booted) && !(r.bg && why === "cancelled")) flashError(r);
     else if (r.bg && r.ms > BG_SLOW_MS) flashSlow(r);
     scheduleActivity();
     if (mode === "log") render();
@@ -1072,8 +1073,10 @@ VIEWER_STYLES = """
   #vw .vw-scrub { flex:1 1 220px; accent-color:var(--accent); min-width:120px; }
   #vw .vw-time { font-variant-numeric:tabular-nums; font-size:12px; color:var(--muted); min-width:120px; }
   #vw .vw-help { color:var(--muted); font-size:11px; }
+  #vw .vw-overlay { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; z-index:1; }
+  #vw .vw-boxinfo { font-size:12px; color:var(--muted); font-variant-numeric:tabular-nums; }
   @media (max-width: 700px) {
-    #vw .vw-help, #vw .vw-hide-narrow { display:none; }
+    #vw .vw-help, #vw .vw-hide-narrow, #vw .vw-boxinfo { display:none; }
     #vw .vw-nav { padding:10px 6px; font-size:18px; }
   }
 """
@@ -1082,6 +1085,11 @@ VIEWER_HTML = """
 <div id="vw" hidden role="dialog" aria-modal="true" aria-label="Media viewer">
   <div class="vw-top">
     <div class="vw-caption" id="vw-caption"></div>
+    <span class="vw-boxinfo" id="vw-boxinfo"></span>
+    <button data-vw="boxes" id="vw-boxes" class="on" title="Detection boxes (B)">▣ Boxes</button>
+    <select id="vw-minconf" title="Only boxes at or above this confidence">
+      <option value="0">all</option><option value="0.5">≥ 0.50</option><option value="0.7">≥ 0.70</option>
+    </select>
     <button data-vw="zoomout" title="Zoom out (-)">−</button>
     <span class="vw-zoom" id="vw-zoom">100%</span>
     <button data-vw="zoomin" title="Zoom in (+)">+</button>
@@ -1093,6 +1101,7 @@ VIEWER_HTML = """
   <div class="vw-stage" id="vw-stage">
     <button class="vw-nav prev" data-vw="prev" title="Previous (PageUp)">‹</button>
     <button class="vw-nav next" data-vw="next" title="Next (PageDown)">›</button>
+    <canvas class="vw-overlay" id="vw-overlay"></canvas>
     <div class="vw-msg" id="vw-msg"></div>
   </div>
   <div class="vw-bottom" id="vw-gifbar" hidden>
@@ -1107,7 +1116,7 @@ VIEWER_HTML = """
       <option value="1" selected>1×</option><option value="2">2×</option>
     </select>
     <button data-vw="loop" id="vw-loop" class="on" title="Loop">⟲</button>
-    <span class="vw-help">space play · ←/→ frame · scroll or pinch to zoom · drag to pan · double-click to zoom in</span>
+    <span class="vw-help">space play · ←/→ frame · B boxes · scroll or pinch to zoom · drag to pan · double-click to zoom in</span>
   </div>
 </div>
 """
@@ -1230,7 +1239,9 @@ VIEWER_SCRIPT = """
   let gallery = [], index = 0, media = null, natW = 0, natH = 0;
   let scale = 1, tx = 0, ty = 0, fitScale = 1;
   let gif = null, frame = 0, playing = false, speed = 1, loop = true, timer = null, loadToken = 0;
+  let boxes = null, boxesState = "", showBoxes = true, minConf = 0;
   const MAX_SCALE = 16;
+  const BOX_COLOURS = {vehicle: "#7aa2ff", person: "#ffb020", plate: "#4ad07a", face: "#ff7ab6", other: "#c8c8d8"};
 
   function stageBox() { return $("vw-stage").getBoundingClientRect(); }
   function apply() {
@@ -1238,6 +1249,67 @@ VIEWER_SCRIPT = """
     media.style.transform = "translate(" + tx + "px," + ty + "px) scale(" + scale + ")";
     media.classList.toggle("pixels", scale >= 2.5);
     $("vw-zoom").textContent = Math.round(scale * 100) + "%";
+    drawBoxes();
+  }
+
+  // ---- Detection boxes ---------------------------------------------------
+  // Drawn on a screen-sized canvas over the picture rather than scaled with
+  // it, so lines and labels stay crisp and readable at any zoom.
+  function currentBoxes() {
+    if (!boxes || !boxes.frames || !boxes.frames.length) return null;
+    const i = gif ? Math.min(frame, boxes.frames.length - 1) : 0;
+    return (boxes.frames[i] || []).filter((b) => b.conf >= minConf);
+  }
+  function drawBoxes() {
+    const canvas = $("vw-overlay");
+    if (!canvas) return;
+    const box = stageBox(), ratio = window.devicePixelRatio || 1;
+    if (canvas.width !== Math.round(box.width * ratio) || canvas.height !== Math.round(box.height * ratio)) {
+      canvas.width = Math.round(box.width * ratio); canvas.height = Math.round(box.height * ratio);
+    }
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    ctx.clearRect(0, 0, box.width, box.height);
+    const list = currentBoxes();
+    updateBoxInfo(list);
+    if (!showBoxes || !list || !media) return;
+    ctx.font = "600 12px ui-sans-serif, system-ui, sans-serif";
+    ctx.textBaseline = "top";
+    for (const b of list) {
+      const x = tx + b.box[0] * natW * scale, y = ty + b.box[1] * natH * scale;
+      const w = b.box[2] * natW * scale, h = b.box[3] * natH * scale;
+      const colour = BOX_COLOURS[b.kind] || BOX_COLOURS.other;
+      ctx.lineWidth = 2; ctx.strokeStyle = colour;
+      ctx.strokeRect(x, y, w, h);
+      const text = b.label + " " + b.conf.toFixed(2);
+      const tw = ctx.measureText(text).width + 8, th = 17;
+      const ly = y - th >= 0 ? y - th : y;   // above the box unless it would leave the screen
+      ctx.fillStyle = colour; ctx.fillRect(x - 1, ly, tw, th);
+      ctx.fillStyle = "#0b0b0f"; ctx.fillText(text, x + 3, ly + 2);
+    }
+  }
+  function updateBoxInfo(list) {
+    const info = $("vw-boxinfo");
+    if (!info) return;
+    if (!boxes) { info.textContent = boxesState; return; }
+    if (!list || !list.length) { info.textContent = gif ? "no detections this frame" : "no detections"; return; }
+    const best = list.reduce((a, b) => (b.conf > a.conf ? b : a));
+    info.textContent = list.length + " detection" + (list.length === 1 ? "" : "s") +
+                       " · best " + best.label + " " + best.conf.toFixed(2);
+  }
+  async function loadBoxes(src, token) {
+    boxes = null;
+    boxesState = "";
+    try {
+      const response = await fetch(src + ".boxes.json", {cache: "no-store", tvQuiet: true});
+      if (token !== loadToken) return;
+      if (response.ok) boxes = await response.json();
+      else boxesState = /\\.gif(\\?|$)/i.test(src) ? "boxes pending: added when the processor is idle"
+                                                  : "no boxes recorded for this image";
+    } catch (error) {
+      boxesState = "";
+    }
+    if (token === loadToken) drawBoxes();
   }
   function clampPan() {
     const box = stageBox(), w = natW * scale, h = natH * scale;
@@ -1290,7 +1362,7 @@ VIEWER_SCRIPT = """
     $("vw").hidden = true;
     document.documentElement.style.overflow = "";
     if (media) { media.remove(); media = null; }
-    gif = null;
+    gif = null; boxes = null; drawBoxes();
   }
   function srcOf(el) { return el.tagName === "A" ? el.href : (el.currentSrc || el.src); }
 
@@ -1307,6 +1379,7 @@ VIEWER_SCRIPT = """
     for (const nav of document.querySelectorAll("#vw .vw-nav")) nav.hidden = gallery.length < 2;
     const isGif = /\\.gif(\\?|$)/i.test(src);
     $("vw-gifbar").hidden = !isGif;
+    loadBoxes(src, token);
     if (isGif) loadGif(src, token); else loadImage(src, token);
   }
 
@@ -1360,6 +1433,7 @@ VIEWER_SCRIPT = """
     if (!gif) return;
     frame = Math.max(0, Math.min(gif.frames.length - 1, i));
     gif.ctx.putImageData(gif.frames[frame].data, 0, 0);
+    drawBoxes();
     $("vw-scrub").value = String(frame);
     $("vw-time").textContent = "frame " + (frame + 1) + "/" + gif.frames.length + " · " +
       (gif.starts[frame] / 1000).toFixed(2) + " / " + (gif.duration / 1000).toFixed(2) + " s";
@@ -1390,6 +1464,7 @@ VIEWER_SCRIPT = """
     prev: () => show(index - 1), next: () => show(index + 1),
     play: () => (playing ? stopPlay() : play()), back: () => step(-1), fwd: () => step(1),
     first: () => step(-1e9),
+    boxes: () => { showBoxes = !showBoxes; $("vw-boxes").classList.toggle("on", showBoxes); drawBoxes(); },
     loop: () => { loop = !loop; $("vw-loop").classList.toggle("on", loop); },
   };
   document.addEventListener("click", (event) => {
@@ -1407,6 +1482,7 @@ VIEWER_SCRIPT = """
     const handled = {
       "Escape": close, "+": actions.zoomin, "=": actions.zoomin, "-": actions.zoomout, "_": actions.zoomout,
       "0": fit, "1": actualSize, "PageUp": actions.prev, "PageDown": actions.next,
+      "b": actions.boxes, "B": actions.boxes,
       " ": () => gif && actions.play(), "Home": () => gif && actions.first(),
       "ArrowLeft": () => (gif ? step(-1) : actions.prev()), "ArrowRight": () => (gif ? step(1) : actions.next()),
     }[k];
@@ -1417,6 +1493,7 @@ VIEWER_SCRIPT = """
     const stage = $("vw-stage");
     $("vw-scrub").addEventListener("input", (event) => { stopPlay(); draw(Number(event.target.value)); });
     $("vw-speed").addEventListener("change", (event) => { speed = Number(event.target.value); if (playing) play(); });
+    $("vw-minconf").addEventListener("change", (event) => { minConf = Number(event.target.value); drawBoxes(); });
     stage.addEventListener("wheel", (event) => {
       event.preventDefault();
       const box = stageBox();
@@ -1475,7 +1552,7 @@ VIEWER_SCRIPT = """
   // ...#view=N opens the Nth snapshot on the page (counting from 0): a link
   // straight to one piece of evidence.
   window.addEventListener("load", () => {
-    const match = /^#view=(\d+)$/.exec(location.hash);
+    const match = /^#view=(\\d+)$/.exec(location.hash);
     if (!match) return;
     const items = [...document.querySelectorAll("img.evidence, a[data-viewer]")];
     if (items[Number(match[1])]) open(items[Number(match[1])]);
@@ -1681,6 +1758,8 @@ def pipeline_status() -> dict[str, Any]:
             state, detail = "processing", None
         elif beat.get("state") == "correlating" and age <= PIPELINE_IDLE_STALE_SECONDS:
             state, detail = "correlating", None
+        elif beat.get("state") == "annotating" and age <= PIPELINE_IDLE_STALE_SECONDS:
+            state, detail = "annotating", f"idle-time detection boxes: {beat.get('annotating')}"
         else:
             state, detail = ("queued", "waiting for the next pass") if result["queue"]["depth"] else ("idle", None)
         by_camera = beat.get("seconds_by_camera") or {}
@@ -1696,7 +1775,7 @@ def pipeline_status() -> dict[str, Any]:
                 "last_gpu_error", "realtime_factor", "seconds_by_camera", "last", "recent",
                 "processed_total", "errors_total", "last_error", "started_ts",
                 "alerts_total", "last_alert_ts", "last_correlation_ts", "last_correlation_raised",
-                "demo",
+                "demo", "annotating", "boxes_pending",
             )},
         )
 
@@ -1785,7 +1864,7 @@ SYSBAR_SCRIPT = """
   // ---- Pipeline: the queue and how far behind the processor is ----------
   const pipe = document.getElementById("pipebar");
   const card = document.getElementById("pipeline-card");
-  const STATE_CLASS = {processing: "good", idle: "", queued: "warn", down: "high",
+  const STATE_CLASS = {processing: "good", annotating: "good", idle: "", queued: "warn", down: "high",
                        stuck: "high", unknown: "warn"};
   function putPipe(key, text, cls, title) {
     const el = pipe.querySelector('[data-k="' + key + '"]');
@@ -1912,7 +1991,7 @@ SYSBAR_SCRIPT = """
       chip.className = on ? "on" + (machine === "down" ? " bad" : machine === "fallback" ? " warn" : "") : "";
     }
     setNode("n-proc", machine === "down" ? "bad" : machine === "fallback" ? "warn"
-                     : (machine === "processing" || machine === "correlating") ? "active" : "ok");
+                     : (machine === "processing" || machine === "correlating" || machine === "annotating") ? "active" : "ok");
     document.getElementById("proc-device").textContent =
       (p.device === "cuda" ? "GPU" : p.has_gpu ? "CPU · GPU resting" : "CPU") +
       (p.realtime_factor != null ? " · " + p.realtime_factor.toFixed(2) + "× real time" : "");
@@ -1940,7 +2019,9 @@ SYSBAR_SCRIPT = """
       ? (c.demo ? "DEMO · " : "") + cameraLabel(c.camera) + " " + clipTime(c.captured_ts) +
         (c.source ? " · " + c.source.replace("Clips", "") : "") + " · " + Math.round(c.elapsed_seconds) + "s" +
         " · " + c.vehicles + " vehicle / " + c.people + " person hits"
-      : p.state === "correlating" ? "re-scoring identities…" : (p.detail || "waiting for clips");
+      : p.state === "correlating" ? "re-scoring identities…"
+      : p.state === "annotating" ? "adding detection boxes to " + p.annotating + (p.boxes_pending > 1 ? " · " + (p.boxes_pending - 1) + " more" : "")
+      : (p.detail || "waiting for clips");
     document.getElementById("proc-foot").textContent =
       (p.processed_total || 0) + " clips since start" +
       (p.cpu_fallbacks ? " · " + p.cpu_fallbacks + " on CPU fallback" : "") +
@@ -2633,7 +2714,7 @@ def index(limit: int = 25):
           <div class="node wide" id="n-proc"><div class="nh"><span class="dot"></span>Processor
               <span class="muted" id="proc-device" style="margin-left:auto;"></span></div>
             <div class="states" id="proc-states">
-              <span data-s="idle">Idle</span><span data-s="queued">Waiting</span><span data-s="processing">Processing</span><span data-s="correlating">Correlating</span><span data-s="fallback">CPU fallback</span><span data-s="down">Down</span>
+              <span data-s="idle">Idle</span><span data-s="queued">Waiting</span><span data-s="processing">Processing</span><span data-s="correlating">Correlating</span><span data-s="annotating">Boxing GIFs</span><span data-s="fallback">CPU fallback</span><span data-s="down">Down</span>
             </div>
             <div class="ns" id="proc-clip">–</div>
             <div class="steps" id="proc-steps">

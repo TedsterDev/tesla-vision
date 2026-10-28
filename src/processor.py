@@ -134,6 +134,11 @@ DEMO_REQUEST_PATH = JOBS_DIR / "demo.json"
 DEMO_CLIPS_DIR = Path(os.environ.get("DEMO_CLIPS_DIR", str(BASE_DIR / "natix-stray")))
 DEMO_MEDIA_DIR = MEDIA_DIR / "demo"
 
+# Must match gif_worker.py: the GIF is GIF_SECONDS from t=0 at GIF_FPS, and
+# the idle box pass rebuilds exactly those frames.
+GIF_SECONDS = env_int("GIF_SECONDS", 5)
+GIF_FPS = env_int("GIF_FPS", 8)
+
 # After the GPU fails a clip (shared-memory exhaustion on an 8 GB Orin), run
 # on the CPU for this long before trying the GPU again.
 GPU_RETRY_SECONDS = env_int("GPU_RETRY_SECONDS", 300)
@@ -277,6 +282,9 @@ class ClipAnalysis:
         self.plate_candidates: list = []
         self.face_observations: list = []   # (FaceDetection, embedding, frame)
         self.frames_analyzed = 0
+        # Every detection on the snapshot frame, for the viewer's boxes.
+        self.best_frame_number: int | None = None
+        self.best_boxes: list[dict] = []
         # For the dashboard's progress display.
         self.plate_frames = 0
         self.face_frames = 0
@@ -335,6 +343,8 @@ def analyze_clip(model: YOLO, video_path: Path, plate_reader=None, face_engine=N
 
         vehicle_boxes_full_res: list[tuple[int, int, int, int]] = []
         saw_person = False
+        boxes_this_frame: list[dict] = []
+        became_best = False
 
         for detection_box in single_frame_result.boxes:
             # Class Index
@@ -348,11 +358,17 @@ def analyze_clip(model: YOLO, video_path: Path, plate_reader=None, face_engine=N
                     "class_id": class_id,
                     "confidence_score": confidence_score,
                 })
+                bx1, by1, bx2, by2 = detection_box.xyxy[0].tolist()
+                boxes_this_frame.append(detection_box_record(
+                    class_id, confidence_score,
+                    (bx1 / scale, by1 / scale, (bx2 - bx1) / scale, (by2 - by1) / scale),
+                    width, height, model))
 
                 # Keep the best scoring original frame for snapshot.
                 if confidence_score > analysis.best_score:
                     analysis.best_score = confidence_score
                     analysis.best_frame = frame.copy()
+                    became_best = True
 
                 if class_id in VEHICLE_CLASS_IDS:
                     # Scale the box back up to full resolution - the plate
@@ -366,12 +382,20 @@ def analyze_clip(model: YOLO, video_path: Path, plate_reader=None, face_engine=N
                 elif class_id == PERSON_CLASS_ID:
                     saw_person = True
 
+        if became_best:
+            analysis.best_frame_number = frame_number
+            analysis.best_boxes = boxes_this_frame
+
         # --- ALPR, budgeted, only where there is a vehicle to read ---------
         if (vehicle_boxes_full_res and alpr_budget > 0
                 and frame_number - last_alpr_frame >= EXPENSIVE_STAGE_FRAME_GAP):
-            analysis.plate_candidates.extend(
-                plate_reader.read_plates(frame, vehicle_boxes_full_res, frame_number)
-            )
+            plates_here = plate_reader.read_plates(frame, vehicle_boxes_full_res, frame_number)
+            analysis.plate_candidates.extend(plates_here)
+            if became_best:
+                for plate in plates_here:
+                    analysis.best_boxes.append(normalised_box(
+                        "plate", f"plate {plate.text}" if plate.text else "plate",
+                        plate.ocr_confidence or plate.det_confidence, plate.bbox, width, height))
             alpr_budget -= 1
             last_alpr_frame = frame_number
             analysis.plate_frames += 1
@@ -381,6 +405,9 @@ def analyze_clip(model: YOLO, video_path: Path, plate_reader=None, face_engine=N
         if (saw_person and face_budget > 0
                 and frame_number - last_face_frame >= EXPENSIVE_STAGE_FRAME_GAP):
             for face_detection in face_engine.detect(frame, frame_number):
+                if became_best:
+                    analysis.best_boxes.append(normalised_box(
+                        "face", "face", face_detection.confidence, face_detection.bbox, width, height))
                 embedding = face_engine.embed(frame, face_detection)
                 if embedding is not None:
                     x, y, w, h = face_detection.bbox
@@ -392,6 +419,147 @@ def analyze_clip(model: YOLO, video_path: Path, plate_reader=None, face_engine=N
             report("faces", analysis)
 
     return analysis
+
+
+# ---------------------------------------------------------------------------
+# Detection boxes for the dashboard's media viewer
+# ---------------------------------------------------------------------------
+# Each snapshot or GIF in media/ can have a `<file>.boxes.json` beside it:
+#     {"v": 1, "source": "snapshot"|"gif", "fps": 8,
+#      "frames": [[{"kind", "label", "conf", "box": [x, y, w, h]}, ...], ...]}
+# Boxes are fractions of the frame (0-1), so one file serves the 1448 px
+# snapshot and the 480 px GIF alike. A snapshot has one frame; a GIF has one
+# entry per GIF frame.
+
+def normalised_box(kind: str, label: str, confidence: float, box, width: int, height: int) -> dict:
+    x, y, w, h = box
+    return {
+        "kind": kind, "label": label, "conf": round(float(confidence or 0), 3),
+        "box": [round(max(0.0, x / width), 4), round(max(0.0, y / height), 4),
+                round(min(1.0, w / width), 4), round(min(1.0, h / height), 4)],
+    }
+
+
+def detection_box_record(class_id: int, confidence: float, box, width: int, height: int, model) -> dict:
+    names = getattr(model, "names", None) or {}
+    label = names.get(class_id, str(class_id)) if isinstance(names, dict) else str(class_id)
+    kind = "vehicle" if class_id in VEHICLE_CLASS_IDS else "person" if class_id == PERSON_CLASS_ID else "other"
+    return normalised_box(kind, label, confidence, box, width, height)
+
+
+def write_boxes(media_file: Path, source: str, frames: list[list[dict]], fps: float | None = None) -> None:
+    payload = {"v": 1, "source": source, "frames": frames}
+    if fps:
+        payload["fps"] = fps
+    target = media_file.with_name(media_file.name + ".boxes.json")
+    temporary = target.with_name("." + target.name + ".tmp")
+    temporary.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    os.replace(temporary, target)
+
+
+def frame_boxes(model, frame, device: str | None = None) -> list[dict]:
+    """Every kept detection on one frame, at the same input width the pipeline uses."""
+    height, width = frame.shape[:2]
+    scale = YOLO_INPUT_WIDTH / width if width > YOLO_INPUT_WIDTH else 1.0
+    small = cv2.resize(frame, (YOLO_INPUT_WIDTH, int(height * scale))) if scale != 1.0 else frame
+    result = model(small, verbose=False, **({"device": device} if device else {}))[0]
+    boxes = []
+    for detection in (result.boxes if result.boxes is not None else []):
+        class_id = int(detection.cls[0].item())
+        confidence = float(detection.conf[0].item())
+        if class_id in KEEP and confidence >= CONFIDENCE_THRESHOLD:
+            x1, y1, x2, y2 = detection.xyxy[0].tolist()
+            boxes.append(detection_box_record(
+                class_id, confidence, (x1 / scale, y1 / scale, (x2 - x1) / scale, (y2 - y1) / scale),
+                width, height, model))
+    return boxes
+
+
+class BoxAnnotator:
+    """
+    Fills in boxes the live pipeline did not compute, only while idle.
+
+    A GIF is the first GIF_SECONDS of its clip at GIF_FPS - 40 frames - but the
+    pipeline samples 30 frames across the whole minute, so at most two or
+    three of them land inside the GIF. Boxes on every GIF frame therefore mean
+    running YOLO on the GIF's own frames, ~2-3 s per alert on the GPU. Done
+    inline that would push a busy drive from ~0.61x toward ~0.85x real time,
+    so it runs only when the queue is empty: live footage first, boxes after.
+    The same pass gives snapshots from before boxes existed their boxes, by
+    running YOLO on the saved JPEG itself.
+    """
+
+    RESCAN_SECONDS = 30
+
+    def __init__(self) -> None:
+        self.todo: list[tuple[str, dict]] = []
+        self.failed: set[str] = set()
+        self.last_scan = 0.0
+
+    def _scan(self) -> None:
+        self.last_scan = time.monotonic()
+        todo = []
+        alerts = sorted(ALERTS_DIR.glob("*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+        for alert_path in alerts[:300]:
+            try:
+                alert = json.loads(alert_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            for kind in ("jpeg", "gif"):
+                name = alert.get(kind)
+                if not name or f"{name}:{kind}" in self.failed:
+                    continue
+                media = MEDIA_DIR / name
+                if media.exists() and not media.with_name(name + ".boxes.json").exists():
+                    todo.append((kind, alert))
+        self.todo = todo
+
+    def pending(self) -> int:
+        if time.monotonic() - self.last_scan > self.RESCAN_SECONDS:
+            self._scan()
+        return len(self.todo)
+
+    def annotate_one(self, detectors: "Detectors") -> str | None:
+        if not self.pending():
+            return None
+        kind, alert = self.todo.pop(0)
+        name = alert[kind]
+        try:
+            if kind == "jpeg":
+                image = cv2.imread(str(MEDIA_DIR / name))
+                if image is None:
+                    raise ValueError("unreadable JPEG")
+                write_boxes(MEDIA_DIR / name, "snapshot", [frame_boxes(detectors.model, image)])
+            else:
+                write_boxes(MEDIA_DIR / name, "gif", self._gif_frames(detectors.model, alert), fps=GIF_FPS)
+            return name
+        except Exception as error:
+            self.failed.add(f"{name}:{kind}")
+            if is_gpu_failure(error):
+                detectors.gpu_retry_after = time.time() + GPU_RETRY_SECONDS
+            print(f"[⚙️ processor] could not box {name}: {error}", flush=True)
+            return None
+
+    def _gif_frames(self, model, alert: dict) -> list[list[dict]]:
+        """YOLO on exactly the frames gif_worker put in the GIF (fps filter from t=0)."""
+        video = PROCESSED_DIR / (alert.get("source_file") or "")
+        capture = cv2.VideoCapture(str(video))
+        if not capture.isOpened():
+            raise FileNotFoundError(f"source clip {video.name} is gone")
+        try:
+            source_fps = capture.get(cv2.CAP_PROP_FPS) or 30.0
+            wanted = [round(k / GIF_FPS * source_fps) for k in range(GIF_SECONDS * GIF_FPS)]
+            frames, index, frame = [], 0, None
+            for target in wanted:
+                while index <= target:
+                    ok, frame = capture.read() if index == target else (capture.grab(), None)
+                    if not ok:
+                        return frames
+                    index += 1
+                frames.append(frame_boxes(model, frame))
+            return frames
+        finally:
+            capture.release()
 
 
 def save_jpeg(frame, alert_id: str) -> str:
@@ -777,6 +945,8 @@ class PipelineStatus:
         self.last_correlation_ts: int | None = None
         self.last_correlation_raised = 0
         self.demo: "DemoFeed | None" = None
+        self.annotating: str | None = None
+        self.boxes_pending = 0
         # The "live edge": the real-world moment the newest analysed footage
         # reaches - a clip's capture time plus its length. "Behind real time"
         # on the dashboard is now minus this. Demo clips keep their own edge,
@@ -885,7 +1055,9 @@ class PipelineStatus:
             "ts": int(now),
             "started_ts": self.started_ts,
             "state": ("processing" if current else "correlating" if self.correlating
-                      else "queued" if pending else "idle"),
+                      else "queued" if pending else "annotating" if self.annotating else "idle"),
+            "annotating": self.annotating,
+            "boxes_pending": self.boxes_pending,
             "device": self.detectors.device,
             "has_gpu": self.detectors.has_gpu,
             "gpu_failures": self.detectors.gpu_failures,
@@ -1040,6 +1212,7 @@ def process_demo_clip(detectors: Detectors, entry: dict, status: "PipelineStatus
         snapshot = f"demo/{clip.stem}.jpg"
         cv2.imwrite(str(MEDIA_DIR / snapshot), analysis.best_frame,
                     [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        write_boxes(MEDIA_DIR / snapshot, "snapshot", [analysis.best_boxes])
     from src.alpr import vote_on_plate_text
     plate = vote_on_plate_text(analysis.plate_candidates) if analysis.plate_candidates else None
     result = {
@@ -1080,6 +1253,7 @@ def process_clip(connection, detectors: Detectors, mp4filefrominbox: Path,
         alert_id = uuid.uuid4().hex[:12]
 
         jpeg = save_jpeg(analysis.best_frame, alert_id)
+        write_boxes(MEDIA_DIR / jpeg, "snapshot", [analysis.best_boxes])
         enqueue_gif(mp4filefrominbox, alert_id)
 
         alert = {
@@ -1183,6 +1357,7 @@ def main():
 
     detectors = Detectors(model, plate_reader, face_engine)
     status = PipelineStatus(detectors)
+    annotator = BoxAnnotator()
     print(f"[⚙️ processor] device: {detectors.device}")
 
     uncorrelated = 0
@@ -1272,6 +1447,19 @@ def main():
             last_correlation = time.monotonic()
 
         if not entries:
+            # Idle: give one GIF or old snapshot its boxes, then look again -
+            # a clip that arrives meanwhile waits at most one GIF's worth.
+            status.boxes_pending = annotator.pending()
+            # Not while a demo runs (it would skew the demo's lag figures), and
+            # not on a resting GPU (the CPU is busy enough as the fallback).
+            if (status.boxes_pending and not (demo and demo.active)
+                    and (detectors.device == "cuda" or not detectors.has_gpu)):
+                status.annotating = annotator.todo[0][1].get(annotator.todo[0][0])
+                status.write(waiting(), force=True)
+                annotator.annotate_one(detectors)
+                status.annotating = None
+                status.boxes_pending = annotator.pending()
+                continue
             status.write(waiting())
             time.sleep(1.0)
 

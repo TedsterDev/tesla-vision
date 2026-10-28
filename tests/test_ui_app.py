@@ -845,7 +845,8 @@ def test_every_page_carries_the_media_viewer():
     for path in ("/", "/plates", "/faces", "/timeline"):
         status, _, body = render(path)
         assert status == 200, (path, status)
-        for marker in ('id="vw"', 'id="vw-scrub"', 'data-vw="play"', "function decodeGif"):
+        for marker in ('id="vw"', 'id="vw-scrub"', 'data-vw="play"', "function decodeGif",
+                       'id="vw-overlay"', 'data-vw="boxes"', 'id="vw-minconf"'):
             assert marker in body, (path, marker)
 
 
