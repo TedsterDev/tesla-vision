@@ -841,6 +841,14 @@ def test_the_settings_page_does_not_reload_the_plate_model_every_visit():
         ui_app._stage_status_cache.clear()
 
 
+def test_every_page_carries_the_media_viewer():
+    for path in ("/", "/plates", "/faces", "/timeline"):
+        status, _, body = render(path)
+        assert status == 200, (path, status)
+        for marker in ('id="vw"', 'id="vw-scrub"', 'data-vw="play"', "function decodeGif"):
+            assert marker in body, (path, marker)
+
+
 # ---------------------------------------------------------------------------
 def main() -> int:
     tests = [

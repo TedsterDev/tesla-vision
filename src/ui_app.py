@@ -1034,6 +1034,458 @@ ACTIVITY_SCRIPT = """
 
 
 # ---------------------------------------------------------------------------
+# Media viewer: click any snapshot or GIF
+# ---------------------------------------------------------------------------
+VIEWER_STYLES = """
+  /* --- Media viewer: zoom for snapshots, play/scrub/zoom for GIFs -------- */
+  img.evidence { cursor:zoom-in; }
+  #vw { position:fixed; inset:0; z-index:1100; background:#050508; display:flex;
+        flex-direction:column; color:var(--text); user-select:none; -webkit-user-select:none; }
+  #vw[hidden] { display:none; }
+  /* The display rules below would otherwise beat the browser's [hidden]. */
+  #vw [hidden] { display:none !important; }
+  #vw .vw-top, #vw .vw-bottom { display:flex; align-items:center; gap:8px; padding:8px 12px;
+        background:rgba(21,21,29,0.92); border-color:var(--line); flex-wrap:wrap; }
+  #vw .vw-top { border-bottom:1px solid var(--line); }
+  #vw .vw-bottom { border-top:1px solid var(--line); }
+  #vw .vw-caption { font-size:13px; min-width:0; flex:1 1 200px; overflow:hidden; text-overflow:ellipsis;
+        white-space:nowrap; }
+  #vw .vw-caption small { color:var(--muted); margin-left:8px; }
+  #vw button, #vw select, #vw a.vw-btn { background:var(--panel-2); color:var(--text); border:1px solid var(--line);
+        border-radius:8px; padding:6px 10px; font:inherit; font-size:13px; cursor:pointer; line-height:1;
+        text-decoration:none; min-width:34px; text-align:center; }
+  #vw button:hover, #vw a.vw-btn:hover { border-color:var(--accent); }
+  #vw button.on { background:var(--accent); color:#0b0b0f; border-color:var(--accent); }
+  #vw button:disabled { opacity:.4; cursor:default; }
+  #vw .vw-zoom { font-variant-numeric:tabular-nums; font-size:12px; color:var(--muted); min-width:44px;
+        text-align:center; }
+  #vw .vw-stage { position:relative; flex:1 1 auto; overflow:hidden; touch-action:none; cursor:grab; }
+  #vw .vw-stage.dragging { cursor:grabbing; }
+  #vw .vw-media { position:absolute; left:0; top:0; transform-origin:0 0; max-width:none;
+        will-change:transform; image-rendering:auto; }
+  #vw .vw-media.pixels { image-rendering:pixelated; }
+  #vw .vw-nav { position:absolute; top:50%; transform:translateY(-50%); z-index:2; font-size:22px;
+        padding:14px 10px; opacity:.75; }
+  #vw .vw-nav.prev { left:10px; } #vw .vw-nav.next { right:10px; }
+  #vw .vw-msg { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+        color:var(--muted); font-size:14px; pointer-events:none; text-align:center; padding:20px; }
+  #vw .vw-scrub { flex:1 1 220px; accent-color:var(--accent); min-width:120px; }
+  #vw .vw-time { font-variant-numeric:tabular-nums; font-size:12px; color:var(--muted); min-width:120px; }
+  #vw .vw-help { color:var(--muted); font-size:11px; }
+  @media (max-width: 700px) {
+    #vw .vw-help, #vw .vw-hide-narrow { display:none; }
+    #vw .vw-nav { padding:10px 6px; font-size:18px; }
+  }
+"""
+
+VIEWER_HTML = """
+<div id="vw" hidden role="dialog" aria-modal="true" aria-label="Media viewer">
+  <div class="vw-top">
+    <div class="vw-caption" id="vw-caption"></div>
+    <button data-vw="zoomout" title="Zoom out (-)">−</button>
+    <span class="vw-zoom" id="vw-zoom">100%</span>
+    <button data-vw="zoomin" title="Zoom in (+)">+</button>
+    <button data-vw="fit" title="Fit to screen (0)">Fit</button>
+    <button data-vw="actual" class="vw-hide-narrow" title="Actual pixels (1)">1:1</button>
+    <a class="vw-btn vw-hide-narrow" id="vw-open" target="_blank" title="Open the original file">↗</a>
+    <button data-vw="close" title="Close (Esc)">✕</button>
+  </div>
+  <div class="vw-stage" id="vw-stage">
+    <button class="vw-nav prev" data-vw="prev" title="Previous (PageUp)">‹</button>
+    <button class="vw-nav next" data-vw="next" title="Next (PageDown)">›</button>
+    <div class="vw-msg" id="vw-msg"></div>
+  </div>
+  <div class="vw-bottom" id="vw-gifbar" hidden>
+    <button data-vw="first" title="First frame (Home)">⏮</button>
+    <button data-vw="back" title="Previous frame (←)">◀︎❙</button>
+    <button data-vw="play" id="vw-play" title="Play / pause (space)">▶</button>
+    <button data-vw="fwd" title="Next frame (→)">❙▶︎</button>
+    <input type="range" class="vw-scrub" id="vw-scrub" min="0" max="0" value="0" aria-label="Scrub frames">
+    <span class="vw-time" id="vw-time">–</span>
+    <select id="vw-speed" title="Playback speed">
+      <option value="0.25">¼×</option><option value="0.5">½×</option>
+      <option value="1" selected>1×</option><option value="2">2×</option>
+    </select>
+    <button data-vw="loop" id="vw-loop" class="on" title="Loop">⟲</button>
+    <span class="vw-help">space play · ←/→ frame · scroll or pinch to zoom · drag to pan · double-click to zoom in</span>
+  </div>
+</div>
+"""
+
+# A self-contained viewer. GIFs are decoded here (LZW, disposal, transparency,
+# interlacing) because no browser lets a page pause or seek an <img> GIF; the
+# frames go to a canvas, which is what makes play/pause, scrubbing and frame
+# stepping possible. No library and no CDN: it has to work in the car.
+VIEWER_SCRIPT = """
+<script>
+(function () {
+  "use strict";
+
+  // ---- GIF decoding ------------------------------------------------------
+  function lzw(minCodeSize, data, pixelCount) {
+    const out = new Uint8Array(pixelCount);
+    const clear = 1 << minCodeSize, eoi = clear + 1;
+    let codeSize = minCodeSize + 1, codeMask = (1 << codeSize) - 1, next = eoi + 1;
+    const prefix = new Int16Array(4096), suffix = new Uint8Array(4096), stack = new Uint8Array(4097);
+    for (let i = 0; i < clear; i++) { prefix[i] = -1; suffix[i] = i; }
+    let datum = 0, bits = 0, pos = 0, old = -1, first = 0, top = 0, o = 0;
+    while (o < pixelCount) {
+      if (top === 0) {
+        if (bits < codeSize) {
+          if (pos >= data.length) break;
+          datum |= data[pos++] << bits; bits += 8; continue;
+        }
+        let code = datum & codeMask; datum >>= codeSize; bits -= codeSize;
+        if (code === clear) { codeSize = minCodeSize + 1; codeMask = (1 << codeSize) - 1; next = eoi + 1; old = -1; continue; }
+        if (code === eoi) break;
+        if (old === -1) { stack[top++] = suffix[code]; old = code; first = code; continue; }
+        const inCode = code;
+        if (code >= next) { stack[top++] = first; code = old; }
+        while (code >= clear) { stack[top++] = suffix[code]; code = prefix[code]; }
+        first = suffix[code]; stack[top++] = first;
+        if (next < 4096) {
+          prefix[next] = old; suffix[next] = first; next++;
+          if ((next & codeMask) === 0 && next < 4096) { codeSize++; codeMask += next; }
+        }
+        old = inCode;
+      }
+      out[o++] = stack[--top];
+    }
+    return out;
+  }
+
+  function decodeGif(buffer) {
+    const b = new Uint8Array(buffer);
+    const sig = String.fromCharCode(b[0], b[1], b[2], b[3], b[4], b[5]);
+    if (sig !== "GIF87a" && sig !== "GIF89a") throw new Error("not a GIF");
+    const W = b[6] | (b[7] << 8), H = b[8] | (b[9] << 8), flags = b[10];
+    let p = 13, gct = null;
+    if (flags & 0x80) { const n = 3 * (1 << ((flags & 7) + 1)); gct = b.subarray(p, p + n); p += n; }
+    const frames = [];
+    let pixels = new Uint8ClampedArray(W * H * 4);
+    let gce = {delay: 0, disposal: 0, trans: -1};
+    const skipBlocks = () => { while (p < b.length && b[p] !== 0) p += b[p] + 1; p++; };
+    while (p < b.length) {
+      const block = b[p++];
+      if (block === 0x3B) break;
+      if (block === 0x21) {
+        const label = b[p++];
+        if (label === 0xF9 && b[p] >= 4) {
+          const packed = b[p + 1];
+          gce = {delay: (b[p + 2] | (b[p + 3] << 8)) * 10, disposal: (packed >> 2) & 7,
+                 trans: packed & 1 ? b[p + 4] : -1};
+        }
+        skipBlocks();
+        continue;
+      }
+      if (block !== 0x2C) throw new Error("bad GIF block 0x" + block.toString(16) + " at " + (p - 1));
+      const x = b[p] | (b[p + 1] << 8), y = b[p + 2] | (b[p + 3] << 8);
+      const w = b[p + 4] | (b[p + 5] << 8), h = b[p + 6] | (b[p + 7] << 8), f = b[p + 8];
+      p += 9;
+      let ct = gct;
+      if (f & 0x80) { const n = 3 * (1 << ((f & 7) + 1)); ct = b.subarray(p, p + n); p += n; }
+      const minCode = b[p++];
+      let total = 0;
+      for (let q = p; q < b.length && b[q] !== 0; q += b[q] + 1) total += b[q];
+      const data = new Uint8Array(total);
+      for (let o = 0; p < b.length && b[p] !== 0;) { const n = b[p++]; data.set(b.subarray(p, p + n), o); o += n; p += n; }
+      p++;
+      const indices = lzw(minCode, data, w * h);
+      // Interlaced images store rows in four passes; map stored -> actual.
+      const rows = [];
+      if (f & 0x40) {
+        for (const [start, step] of [[0, 8], [4, 8], [2, 4], [1, 2]]) for (let r = start; r < h; r += step) rows.push(r);
+      } else for (let r = 0; r < h; r++) rows.push(r);
+      const before = gce.disposal === 3 ? pixels.slice() : null;
+      if (ct) {
+        for (let k = 0; k < h; k++) {
+          const py = y + rows[k];
+          if (py >= H) continue;
+          for (let col = 0; col < w; col++) {
+            const idx = indices[k * w + col];
+            if (idx === gce.trans) continue;
+            const px = x + col;
+            if (px >= W) continue;
+            const d = (py * W + px) * 4, c = idx * 3;
+            pixels[d] = ct[c]; pixels[d + 1] = ct[c + 1]; pixels[d + 2] = ct[c + 2]; pixels[d + 3] = 255;
+          }
+        }
+      }
+      // Browsers play delays under 20 ms at 100 ms; match them.
+      frames.push({data: new ImageData(pixels.slice(), W, H), delay: gce.delay >= 20 ? gce.delay : 100});
+      if (gce.disposal === 2) {
+        for (let r = y; r < Math.min(y + h, H); r++) pixels.fill(0, (r * W + x) * 4, (r * W + Math.min(x + w, W)) * 4);
+      } else if (gce.disposal === 3 && before) {
+        pixels = before;
+      }
+      gce = {delay: 0, disposal: 0, trans: -1};
+    }
+    if (!frames.length) throw new Error("GIF has no frames");
+    return {width: W, height: H, frames};
+  }
+  window.tvDecodeGif = decodeGif;   // exposed for testing
+
+  // ---- The viewer ---------------------------------------------------------
+  const $ = (id) => document.getElementById(id);
+  let gallery = [], index = 0, media = null, natW = 0, natH = 0;
+  let scale = 1, tx = 0, ty = 0, fitScale = 1;
+  let gif = null, frame = 0, playing = false, speed = 1, loop = true, timer = null, loadToken = 0;
+  const MAX_SCALE = 16;
+
+  function stageBox() { return $("vw-stage").getBoundingClientRect(); }
+  function apply() {
+    if (!media) return;
+    media.style.transform = "translate(" + tx + "px," + ty + "px) scale(" + scale + ")";
+    media.classList.toggle("pixels", scale >= 2.5);
+    $("vw-zoom").textContent = Math.round(scale * 100) + "%";
+  }
+  function clampPan() {
+    const box = stageBox(), w = natW * scale, h = natH * scale;
+    // Keep at least a quarter of the picture on screen.
+    tx = Math.min(box.width - w * 0.25, Math.max(-w * 0.75, tx));
+    ty = Math.min(box.height - h * 0.25, Math.max(-h * 0.75, ty));
+  }
+  function fit() {
+    const box = stageBox();
+    if (!natW || !natH) return;
+    // Small crops (plates, faces) are worth enlarging - up to 4x.
+    fitScale = Math.min(box.width / natW, box.height / natH, 4);
+    scale = fitScale;
+    tx = (box.width - natW * scale) / 2; ty = (box.height - natH * scale) / 2;
+    apply();
+  }
+  function zoomAt(factor, cx, cy) {
+    const box = stageBox();
+    if (cx == null) { cx = box.width / 2; cy = box.height / 2; }
+    const next = Math.min(MAX_SCALE, Math.max(fitScale * 0.5, scale * factor));
+    tx = cx - (cx - tx) * (next / scale); ty = cy - (cy - ty) * (next / scale);
+    scale = next; clampPan(); apply();
+  }
+  function actualSize() { zoomAt(1 / scale); }
+
+  function caption(img) {
+    const src = img.currentSrc || img.src;
+    const name = decodeURIComponent(src.split("/").pop().split("?")[0]);
+    const row = img.closest("tr, .card, .grid > *");
+    const context = row ? row.textContent.replace(/\\s+/g, " ").trim().slice(0, 90) : "";
+    return {name, context};
+  }
+
+  function setMedia(element) {
+    const stage = $("vw-stage");
+    if (media) media.remove();
+    media = element; media.classList.add("vw-media");
+    stage.insertBefore(media, $("vw-msg"));
+  }
+
+  function open(img) {
+    gallery = [...document.querySelectorAll("img.evidence, a[data-viewer]")].filter((el) => el.offsetParent !== null || el === img);
+    index = Math.max(0, gallery.indexOf(img));
+    $("vw").hidden = false;
+    document.documentElement.style.overflow = "hidden";
+    show(index);
+  }
+  function close() {
+    stopPlay(); loadToken++;
+    $("vw").hidden = true;
+    document.documentElement.style.overflow = "";
+    if (media) { media.remove(); media = null; }
+    gif = null;
+  }
+  function srcOf(el) { return el.tagName === "A" ? el.href : (el.currentSrc || el.src); }
+
+  function show(i) {
+    stopPlay(); gif = null; frame = 0;
+    index = (i + gallery.length) % gallery.length;
+    const el = gallery[index], src = srcOf(el);
+    const token = ++loadToken;
+    const info = el.tagName === "A" ? {name: decodeURIComponent(src.split("/").pop()), context: el.title || ""} : caption(el);
+    $("vw-caption").textContent = info.name;
+    if (info.context) { const small = document.createElement("small"); small.textContent = info.context; $("vw-caption").appendChild(small); }
+    $("vw-open").href = src;
+    $("vw-msg").textContent = "Loading…";
+    for (const nav of document.querySelectorAll("#vw .vw-nav")) nav.hidden = gallery.length < 2;
+    const isGif = /\\.gif(\\?|$)/i.test(src);
+    $("vw-gifbar").hidden = !isGif;
+    if (isGif) loadGif(src, token); else loadImage(src, token);
+  }
+
+  function loadImage(src, token) {
+    const img = new Image();
+    img.onload = () => {
+      if (token !== loadToken) return;
+      natW = img.naturalWidth; natH = img.naturalHeight;
+      setMedia(img); $("vw-msg").textContent = ""; fit();
+      appendDims();
+    };
+    img.onerror = () => { if (token === loadToken) $("vw-msg").textContent = "Could not load " + src; };
+    img.src = src; img.alt = "";
+  }
+  function appendDims(extra) {
+    const small = document.createElement("small");
+    small.textContent = natW + "×" + natH + (extra ? " · " + extra : "");
+    $("vw-caption").appendChild(small);
+  }
+
+  async function loadGif(src, token) {
+    $("vw-msg").textContent = "Decoding GIF frames…";
+    try {
+      const response = await fetch(src);
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      const buffer = await response.arrayBuffer();
+      if (token !== loadToken) return;
+      const decoded = decodeGif(buffer);
+      if (token !== loadToken) return;
+      gif = decoded; natW = gif.width; natH = gif.height;
+      gif.starts = []; let t = 0;
+      for (const f of gif.frames) { gif.starts.push(t); t += f.delay; }
+      gif.duration = t;
+      const canvas = document.createElement("canvas");
+      canvas.width = natW; canvas.height = natH;
+      gif.ctx = canvas.getContext("2d");
+      setMedia(canvas); $("vw-msg").textContent = "";
+      $("vw-scrub").max = String(gif.frames.length - 1);
+      fit(); appendDims(gif.frames.length + " frames · " + (gif.duration / 1000).toFixed(1) + " s");
+      draw(0); play();
+    } catch (error) {
+      if (token !== loadToken) return;
+      // Fall back to the browser's own (unscrubbable) playback.
+      $("vw-gifbar").hidden = true;
+      loadImage(src, token);
+      setTimeout(() => { if (token === loadToken) $("vw-msg").textContent = ""; }, 10);
+      console.warn("GIF decode failed, showing it plainly:", error);
+    }
+  }
+  function draw(i) {
+    if (!gif) return;
+    frame = Math.max(0, Math.min(gif.frames.length - 1, i));
+    gif.ctx.putImageData(gif.frames[frame].data, 0, 0);
+    $("vw-scrub").value = String(frame);
+    $("vw-time").textContent = "frame " + (frame + 1) + "/" + gif.frames.length + " · " +
+      (gif.starts[frame] / 1000).toFixed(2) + " / " + (gif.duration / 1000).toFixed(2) + " s";
+  }
+  function tick() {
+    if (!playing || !gif) return;
+    let nextFrame = frame + 1;
+    if (nextFrame >= gif.frames.length) {
+      if (!loop) { stopPlay(); return; }
+      nextFrame = 0;
+    }
+    draw(nextFrame);
+    timer = setTimeout(tick, gif.frames[frame].delay / speed);
+  }
+  function play() {
+    if (!gif) return;
+    if (frame >= gif.frames.length - 1 && !loop) draw(0);
+    playing = true; $("vw-play").textContent = "❚❚";
+    clearTimeout(timer); timer = setTimeout(tick, gif.frames[frame].delay / speed);
+  }
+  function stopPlay() { playing = false; clearTimeout(timer); const b = $("vw-play"); if (b) b.textContent = "▶"; }
+  function step(delta) { stopPlay(); draw(frame + delta); }
+
+  // ---- Input: buttons, keys, wheel, drag, pinch, double-tap ----------------
+  const actions = {
+    close, fit, actual: actualSize,
+    zoomin: () => zoomAt(1.4), zoomout: () => zoomAt(1 / 1.4),
+    prev: () => show(index - 1), next: () => show(index + 1),
+    play: () => (playing ? stopPlay() : play()), back: () => step(-1), fwd: () => step(1),
+    first: () => step(-1e9),
+    loop: () => { loop = !loop; $("vw-loop").classList.toggle("on", loop); },
+  };
+  document.addEventListener("click", (event) => {
+    const button = event.target.closest && event.target.closest("[data-vw]");
+    if (button && !$("vw").hidden) { event.preventDefault(); actions[button.dataset.vw](); return; }
+    const target = event.target.closest && event.target.closest("img.evidence, a[data-viewer]");
+    if (!target || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey) return;
+    event.preventDefault(); event.stopPropagation();
+    open(target);
+  }, true);
+
+  document.addEventListener("keydown", (event) => {
+    if ($("vw").hidden) return;
+    const k = event.key;
+    const handled = {
+      "Escape": close, "+": actions.zoomin, "=": actions.zoomin, "-": actions.zoomout, "_": actions.zoomout,
+      "0": fit, "1": actualSize, "PageUp": actions.prev, "PageDown": actions.next,
+      " ": () => gif && actions.play(), "Home": () => gif && actions.first(),
+      "ArrowLeft": () => (gif ? step(-1) : actions.prev()), "ArrowRight": () => (gif ? step(1) : actions.next()),
+    }[k];
+    if (handled) { event.preventDefault(); event.stopPropagation(); handled(); }
+  }, true);
+
+  document.addEventListener("DOMContentLoaded", () => {
+    const stage = $("vw-stage");
+    $("vw-scrub").addEventListener("input", (event) => { stopPlay(); draw(Number(event.target.value)); });
+    $("vw-speed").addEventListener("change", (event) => { speed = Number(event.target.value); if (playing) play(); });
+    stage.addEventListener("wheel", (event) => {
+      event.preventDefault();
+      const box = stageBox();
+      zoomAt(Math.exp(-event.deltaY * (event.deltaMode === 1 ? 0.05 : 0.0015)), event.clientX - box.left, event.clientY - box.top);
+    }, {passive: false});
+
+    const pointers = new Map();
+    let pinch = null, lastTap = 0, moved = false;
+    stage.addEventListener("pointerdown", (event) => {
+      if (event.target.closest("button")) return;
+      stage.setPointerCapture(event.pointerId);
+      pointers.set(event.pointerId, {x: event.clientX, y: event.clientY});
+      moved = false;
+      if (pointers.size === 2) {
+        const [a, b] = [...pointers.values()];
+        pinch = {dist: Math.hypot(a.x - b.x, a.y - b.y), mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2};
+      }
+      stage.classList.add("dragging");
+    });
+    stage.addEventListener("pointermove", (event) => {
+      const prev = pointers.get(event.pointerId);
+      if (!prev) return;
+      const now = {x: event.clientX, y: event.clientY};
+      pointers.set(event.pointerId, now);
+      if (pointers.size === 2 && pinch) {
+        const [a, b] = [...pointers.values()];
+        const dist = Math.hypot(a.x - b.x, a.y - b.y), mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+        const box = stageBox();
+        tx += mx - pinch.mx; ty += my - pinch.my;
+        zoomAt(dist / pinch.dist, mx - box.left, my - box.top);
+        pinch = {dist, mx, my}; moved = true;
+      } else if (pointers.size === 1) {
+        const dx = now.x - prev.x, dy = now.y - prev.y;
+        if (Math.abs(dx) + Math.abs(dy) > 1) moved = true;
+        tx += dx; ty += dy; clampPan(); apply();
+      }
+    });
+    const release = (event) => {
+      pointers.delete(event.pointerId);
+      if (pointers.size < 2) pinch = null;
+      if (!pointers.size) stage.classList.remove("dragging");
+      if (event.type === "pointerup" && !moved && !event.target.closest("button")) {
+        const now = performance.now();
+        if (now - lastTap < 320) {           // double-click or double-tap
+          const box = stageBox();
+          if (scale > fitScale * 1.05) fit();
+          else zoomAt(Math.max(2.5, 3 * fitScale) / scale, event.clientX - box.left, event.clientY - box.top);
+          lastTap = 0;
+        } else lastTap = now;
+      }
+    };
+    stage.addEventListener("pointerup", release);
+    stage.addEventListener("pointercancel", release);
+    window.addEventListener("resize", () => { if (!$("vw").hidden) fit(); });
+  });
+  // ...#view=N opens the Nth snapshot on the page (counting from 0): a link
+  // straight to one piece of evidence.
+  window.addEventListener("load", () => {
+    const match = /^#view=(\d+)$/.exec(location.hash);
+    if (!match) return;
+    const items = [...document.querySelectorAll("img.evidence, a[data-viewer]")];
+    if (items[Number(match[1])]) open(items[Number(match[1])]);
+  });
+})();
+</script>
+"""
+
+
+# ---------------------------------------------------------------------------
 # Orin box monitoring (the footer on every page)
 # ---------------------------------------------------------------------------
 # A container shares the host kernel, so /proc and /sys here describe the whole
@@ -1548,6 +2000,7 @@ SYSBAR_SCRIPT = """
         link.target = "_blank";
         link.textContent = "📷";
         link.title = "best frame from this demo clip";
+        link.dataset.viewer = "1";
         const td = document.createElement("td");
         td.appendChild(link);
         tr.appendChild(td);
@@ -1647,7 +2100,7 @@ def render_page(title: str, body: str, active_path: str = "", head_extra: str = 
   <meta charset="utf-8" />
   <title>{esc(title)} - Tesla Vision</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>{PAGE_STYLES}{ACTIVITY_STYLES}</style>
+  <style>{PAGE_STYLES}{ACTIVITY_STYLES}{VIEWER_STYLES}</style>
   <script>var URL_ROOT = {url_root_js};</script>
   {ACTIVITY_SCRIPT}
   {head_extra}
@@ -1671,6 +2124,8 @@ def render_page(title: str, body: str, active_path: str = "", head_extra: str = 
     </div>
   </footer>
   {SYSBAR_SCRIPT}
+  {VIEWER_HTML}
+  {VIEWER_SCRIPT}
 </body></html>""")
 
 
@@ -2641,6 +3096,7 @@ def timeline_view():
               if (point.image) {
                 popup.appendChild(document.createElement("br"));
                 const evidence = document.createElement("img");
+                evidence.className = "evidence";
                 evidence.src = URL_ROOT + "/media/" + encodeURIComponent(point.image);
                 evidence.style.maxWidth = "180px";
                 evidence.style.borderRadius = "6px";
