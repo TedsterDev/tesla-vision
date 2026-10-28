@@ -92,6 +92,10 @@ async def tesla_dashboard_app_lifespan(app: FastAPI):
     else:
         print("[🔐 ui] Basic Auth DISABLED (set DASHBOARD_PASS to enable)")
 
+    # Off the event loop: it loads a YOLO model, and startup must not wait.
+    import threading
+    threading.Thread(target=_warm_stage_status, name="warm-settings", daemon=True).start()
+
     # Pull any alert JSON written before the database existed into the alerts
     # table, so upgrading doesn't appear to lose history.
     #
@@ -389,7 +393,25 @@ class _StripUrlRoot:
                 raw_path = scope.get("raw_path")
                 if raw_path and raw_path.startswith(URL_ROOT.encode() + b"/"):
                     scope["raw_path"] = raw_path[len(URL_ROOT):]
-        await self.inner(scope, receive, send)
+        if scope["type"] != "http":
+            await self.inner(scope, receive, send)
+            return
+
+        # Server-Timing: how long the Orin spent before the first byte. The
+        # loading screen reads it from the browser's navigation and resource
+        # timing, which is how it can say "the Orin built this page in 9 ms"
+        # separately from the network time around it.
+        started = time.perf_counter()
+
+        async def timed_send(message):
+            if message["type"] == "http.response.start":
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                headers = list(message.get("headers", []))
+                headers.append((b"server-timing", f"app;dur={elapsed_ms:.1f};desc=\"Orin\"".encode()))
+                message = dict(message, headers=headers)
+            await send(message)
+
+        await self.inner(scope, receive, timed_send)
 
 
 app.add_middleware(_StripUrlRoot)
@@ -546,6 +568,454 @@ NAV_TABS = [
     ("/gps", "GPS"),
     ("/settings", "Settings"),
 ]
+
+
+# ---------------------------------------------------------------------------
+# Activity layer: the loading screen, and anything loading after it
+# ---------------------------------------------------------------------------
+# On every page: a loading screen built from the browser's own measurements
+# (navigation timing, the Server-Timing header _StripUrlRoot adds, and every
+# fetch the page makes), shown again the moment a link is followed; then a
+# progress bar and pill for any request still running after 250 ms, a
+# spinner on the button that started it, red for failures, and a log of all
+# of it behind the footer's "Loaded in" badge. Repeated GETs to one URL are
+# the pages' polling and stay out of sight unless slow or failing.
+ACTIVITY_STYLES = """
+  /* --- Activity layer: loading screen, progress bar, pill, log ---------- */
+  #tv-boot { position:fixed; inset:0; z-index:1000; background:rgba(11,11,15,0.97);
+             display:flex; align-items:center; justify-content:center; padding:16px;
+             transition:opacity .35s ease; }
+  #tv-boot.fade { opacity:0; pointer-events:none; }
+  #tv-boot[hidden] { display:none; }
+  #tv-boot .panel { width:min(640px, 100%); max-height:calc(100vh - 32px); overflow:auto;
+                    background:var(--panel); border:1px solid var(--line); border-radius:16px;
+                    padding:18px 18px 14px; box-shadow:0 20px 60px rgba(0,0,0,.5); }
+  #tv-boot .top { display:flex; align-items:center; gap:12px; margin-bottom:4px; }
+  #tv-boot .title { font-weight:800; font-size:17px; letter-spacing:-0.01em; }
+  #tv-boot .elapsed { margin-left:auto; font-variant-numeric:tabular-nums; color:var(--muted);
+                      font-size:13px; }
+  #tv-boot .close { background:none; border:0; color:var(--muted); font-size:18px; cursor:pointer;
+                    padding:0 2px; }
+  #tv-boot .where { color:var(--muted); font-size:12px; margin-bottom:12px; overflow-wrap:anywhere; }
+  #tv-boot .meter { height:4px; background:var(--line); border-radius:2px; overflow:hidden;
+                    margin-bottom:12px; }
+  #tv-boot .meter div { height:100%; width:0; background:var(--accent); transition:width .25s ease; }
+  #tv-boot ol { list-style:none; margin:0; padding:0; font-size:13px; }
+  #tv-boot li { display:grid; grid-template-columns:18px 1fr auto; gap:8px; align-items:baseline;
+                padding:4px 0; border-bottom:1px solid rgba(42,42,56,.6); }
+  #tv-boot li .what { overflow-wrap:anywhere; }
+  #tv-boot li .what small { display:block; color:var(--muted); font-size:11px; }
+  #tv-boot li .ms { font-variant-numeric:tabular-nums; color:var(--muted); font-size:12px;
+                    white-space:nowrap; }
+  #tv-boot li.bg { opacity:.6; }
+  #tv-boot .ico { width:14px; height:14px; display:inline-block; text-align:center; line-height:14px;
+                  font-size:12px; }
+  #tv-boot .ok   .ico { color:var(--low); }
+  #tv-boot .fail .ico { color:var(--high); }
+  #tv-boot .fail .what { color:var(--high); }
+  #tv-boot .run  .ico { border:2px solid var(--line); border-top-color:var(--accent);
+                        border-radius:50%; animation:tvspin .8s linear infinite; width:10px; height:10px; }
+  #tv-boot .foot { color:var(--muted); font-size:11px; margin-top:10px; }
+  @keyframes tvspin { to { transform:rotate(360deg); } }
+
+  #tv-bar { position:fixed; top:0; left:0; right:0; height:3px; z-index:999; pointer-events:none;
+            opacity:0; transition:opacity .2s; overflow:hidden; }
+  #tv-bar.on { opacity:1; }
+  #tv-bar div { position:absolute; top:0; bottom:0; width:40%; background:var(--accent);
+                animation:tvslide 1.1s ease-in-out infinite; }
+  #tv-bar.err div { background:var(--high); animation:none; width:100%; }
+  @keyframes tvslide { from { left:-40%; } to { left:100%; } }
+
+  #tv-pill { position:fixed; right:14px; bottom:14px; z-index:998; max-width:min(420px, calc(100vw - 28px));
+             background:var(--panel); border:1px solid var(--line); border-radius:999px;
+             padding:7px 14px; font-size:12px; display:flex; gap:8px; align-items:center;
+             box-shadow:0 8px 24px rgba(0,0,0,.4); cursor:pointer; transition:opacity .2s, transform .2s; }
+  #tv-pill[hidden] { display:none; }
+  #tv-pill.err { border-color:var(--high); color:var(--high); }
+  #tv-pill .spin { width:10px; height:10px; border:2px solid var(--line); border-top-color:var(--accent);
+                   border-radius:50%; animation:tvspin .8s linear infinite; flex:0 0 auto; }
+  #tv-pill span.t { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  button.tv-busy { position:relative; color:transparent !important; pointer-events:none; }
+  button.tv-busy::after { content:""; position:absolute; left:50%; top:50%; width:12px; height:12px;
+                          margin:-8px 0 0 -8px; border:2px solid var(--muted); border-top-color:var(--accent);
+                          border-radius:50%; animation:tvspin .8s linear infinite; }
+  .tv-loadbadge { cursor:pointer; text-decoration:underline dotted; }
+  @media (prefers-reduced-motion: reduce) {
+    #tv-bar div, #tv-pill .spin, #tv-boot .run .ico, button.tv-busy::after { animation:none; }
+  }
+"""
+
+ACTIVITY_HTML = """
+<noscript><style>#tv-boot { display:none !important; }</style></noscript>
+<div id="tv-boot" role="status" aria-live="polite">
+  <div class="panel">
+    <div class="top"><span class="title" id="tv-boot-title">Loading Tesla Vision</span>
+      <span class="elapsed" id="tv-boot-elapsed">0 ms</span>
+      <button class="close" id="tv-boot-close" title="Hide (Esc)" hidden>✕</button></div>
+    <div class="where" id="tv-boot-where"></div>
+    <div class="meter"><div id="tv-boot-meter"></div></div>
+    <ol id="tv-boot-steps"></ol>
+    <div class="foot" id="tv-boot-foot">Every line is measured by this browser, not estimated.</div>
+  </div>
+</div>
+<div id="tv-bar"><div></div></div>
+<div id="tv-pill" hidden title="Open the activity log"><span class="spin"></span><span class="t" id="tv-pill-text"></span></div>
+"""
+
+# Runs in <head>, before any page script, so its fetch wrapper sees every
+# request a page makes. Plain string (JavaScript braces). It only touches the
+# DOM once the body exists.
+ACTIVITY_SCRIPT = """
+<script>
+(function () {
+  "use strict";
+  const T0 = performance.now();   // ms since this navigation began
+  const log = [];                 // every request this page has made
+  const inflight = new Set();     // foreground requests still running
+  const seenGets = new Set();     // a GET URL seen before is a poll -> background
+  const BG_SLOW_MS = 3000, FG_SHOW_MS = 250;
+  let booted = false, bootDone = null, mode = "boot";   // boot | nav | log | hidden
+  let lastButton = null, lastButtonAt = 0;
+  const $ = (id) => document.getElementById(id);
+
+  function fmtMs(ms) { return ms < 1000 ? Math.round(ms) + " ms" : (ms / 1000).toFixed(ms < 10000 ? 2 : 1) + " s"; }
+  function fmtKB(bytes) { return bytes == null ? "" : bytes < 1024 ? bytes + " B" : (bytes / 1024).toFixed(bytes < 10240 ? 1 : 0) + " KB"; }
+  function shortPath(url) {
+    try { const u = new URL(url, location.href); return (u.origin === location.origin ? "" : u.host) + u.pathname + (u.search.length > 1 && u.search.length < 30 ? u.search : ""); }
+    catch (e) { return String(url); }
+  }
+  function serverMs(entry) {
+    const t = entry && entry.serverTiming && entry.serverTiming.find((s) => s.name === "app");
+    return t ? t.duration : null;
+  }
+  function timingFor(url) {
+    try {
+      const list = performance.getEntriesByName(new URL(url, location.href).href);
+      return list.length ? list[list.length - 1] : null;
+    } catch (e) { return null; }
+  }
+
+  // ---- The step list (loading screen and log view share it) -------------
+  const steps = [];
+  // Display order, whatever order things happen in: the footer's first
+  // fetches start before DOMContentLoaded, but connecting came first.
+  const RANK = {conn: 1, ttfb: 2, dl: 3, dom: 4, assets: 5, img: 30, ready: 99};
+  function step(key, what, detail) {
+    let s = steps.find((x) => x.key === key);
+    if (!s) {
+      s = {key, what, detail: detail || "", state: "run", ms: null, bg: false,
+           rank: RANK[key] || 10, seq: steps.length};
+      steps.push(s);
+      steps.sort((a, b) => a.rank - b.rank || a.seq - b.seq);
+    }
+    else { s.what = what; if (detail != null) s.detail = detail; }
+    render(); return s;
+  }
+  function settle(key, state, ms, detail) {
+    const s = steps.find((x) => x.key === key);
+    if (!s) return;
+    s.state = state; s.ms = ms; if (detail != null) s.detail = detail;
+    render();
+  }
+  function fillSizes() {
+    // A resource's timing entry (size, Server-Timing) appears only once its
+    // body has arrived - after fetch() resolves - so look it up late.
+    for (const r of log) {
+      if (r.state === "run" || r.sized) continue;
+      const t = timingFor(r.url);
+      if (!t) continue;
+      r.sized = true;
+      r.size = t.encodedBodySize || t.transferSize || null;
+      r.server = serverMs(t);
+      const s = steps.find((x) => x.key === "f" + r.id);
+      if (s) s.detail = (r.status ? "HTTP " + r.status : "") + (r.size ? " · " + fmtKB(r.size) : "") +
+                        (r.server != null ? " · Orin " + fmtMs(r.server) : "");
+    }
+  }
+  function render() {
+    const list = $("tv-boot-steps");
+    if (!list || mode === "hidden") return;
+    fillSizes();
+    const shown = mode === "log" ? steps.concat(log.filter((r) => r.after).map(logStep)) : steps;
+    list.replaceChildren(...shown.map((s) => {
+      const li = document.createElement("li");
+      li.className = s.state + (s.bg ? " bg" : "");
+      const ico = document.createElement("span"); ico.className = "ico";
+      ico.textContent = s.state === "ok" ? "✓" : s.state === "fail" ? "✗" : s.state === "info" ? "·" : "";
+      const what = document.createElement("span"); what.className = "what"; what.textContent = s.what;
+      if (s.detail) { const small = document.createElement("small"); small.textContent = s.detail; what.appendChild(small); }
+      const ms = document.createElement("span"); ms.className = "ms";
+      ms.textContent = s.ms != null ? fmtMs(s.ms) : s.state === "run" ? "…" : "";
+      li.append(ico, what, ms); return li;
+    }));
+    const done = steps.filter((s) => s.state !== "run").length;
+    const meter = $("tv-boot-meter");
+    if (meter) meter.style.width = (mode === "nav" ? 30 : Math.round(100 * done / Math.max(steps.length, 1))) + "%";
+  }
+  function logStep(r) {
+    return {key: "log" + r.id, what: r.method + " " + r.path,
+            detail: (r.status ? r.status + " · " : "") + (r.size != null ? fmtKB(r.size) + " · " : "") +
+                    (r.server != null ? "Orin " + fmtMs(r.server) + " · " : "") + (r.bg ? "background refresh · " : "") +
+                    new Date(r.wall).toLocaleTimeString(),
+            state: r.state, ms: r.ms, bg: r.bg};
+  }
+
+  // ---- fetch: every request, logged; foreground ones shown ----------------
+  const realFetch = window.fetch.bind(window);
+  let nextId = 1;
+  window.fetch = function (input, init) {
+    const url = typeof input === "string" ? input : (input && input.url) || String(input);
+    const method = ((init && init.method) || (input && input.method) || "GET").toUpperCase();
+    const path = shortPath(url);
+    const key = method + " " + path.split("?")[0];
+    const bg = (init && init.tvBackground) || (method === "GET" && seenGets.has(key));
+    if (method === "GET") seenGets.add(key);
+    const r = {id: nextId++, method, path, url, bg, state: "run", start: performance.now(), wall: Date.now(),
+               after: booted, status: null, ms: null, size: null, server: null};
+    log.push(r); if (log.length > 150) log.shift();
+    if (!booted) step("f" + r.id, method + " " + path, "requesting…");
+    if (!bg) { inflight.add(r); scheduleActivity(); }
+    if (method !== "GET" && lastButton && performance.now() - lastButtonAt < 400 && document.contains(lastButton)) {
+      r.button = lastButton; r.button.classList.add("tv-busy");
+    }
+    return realFetch(input, init).then((response) => {
+      finish(r, response.ok ? "ok" : "fail", response.status);
+      return response;
+    }, (error) => {
+      finish(r, "fail", null, error && error.name === "AbortError" ? "cancelled" : "network error");
+      throw error;
+    });
+  };
+  function finish(r, state, status, why) {
+    r.ms = performance.now() - r.start; r.state = state; r.status = status || why || null;
+    inflight.delete(r);
+    setTimeout(render, 300);   // by then the body is usually in: sizes appear
+    if (r.button) r.button.classList.remove("tv-busy");
+    if (!r.after) {
+      settle("f" + r.id, state, r.ms,
+        (status ? "HTTP " + status : why || "") + (r.size ? " · " + fmtKB(r.size) : "") +
+        (r.server != null ? " · Orin " + fmtMs(r.server) : ""));
+    }
+    if (state === "fail" && (r.after || booted) && !(r.bg && why === "cancelled")) flashError(r);
+    else if (r.bg && r.ms > BG_SLOW_MS) flashSlow(r);
+    scheduleActivity();
+    if (mode === "log") render();
+    if (!booted) maybeBootDone();
+  }
+  document.addEventListener("click", (event) => {
+    const button = event.target.closest && event.target.closest("button");
+    if (button) { lastButton = button; lastButtonAt = performance.now(); }
+  }, true);
+
+  // ---- After load: top bar + pill for anything foreground -----------------
+  let activityTimer = null, pillHold = null;
+  function scheduleActivity() {
+    clearTimeout(activityTimer);
+    activityTimer = setTimeout(showActivity, inflight.size ? FG_SHOW_MS : 0);
+  }
+  function showActivity() {
+    if (!booted || mode === "nav") return;
+    const bar = $("tv-bar"), pill = $("tv-pill"), text = $("tv-pill-text");
+    if (!bar || !pill) return;
+    const running = [...inflight].filter((r) => performance.now() - r.start >= FG_SHOW_MS);
+    if (running.length) {
+      bar.className = "on";
+      const first = running[0];
+      text.textContent = first.method + " " + first.path + " · " + fmtMs(performance.now() - first.start) +
+                         (running.length > 1 ? " · +" + (running.length - 1) + " more" : "");
+      pill.className = ""; pill.hidden = false; pill.querySelector(".spin").hidden = false;
+      clearTimeout(activityTimer); activityTimer = setTimeout(showActivity, 200);
+    } else if (!pillHold) {
+      bar.className = ""; pill.hidden = true;
+    }
+  }
+  function flashError(r) {
+    const bar = $("tv-bar"), pill = $("tv-pill"), text = $("tv-pill-text");
+    if (!pill) return;
+    text.textContent = "✗ " + r.method + " " + r.path + " failed" + (r.status ? " (" + r.status + ")" : "");
+    pill.className = "err"; pill.hidden = false; pill.querySelector(".spin").hidden = true;
+    bar.className = "on err";
+    clearTimeout(pillHold);
+    pillHold = setTimeout(() => { pillHold = null; bar.className = ""; showActivity(); }, 6000);
+  }
+  function flashSlow(r) {
+    const pill = $("tv-pill"), text = $("tv-pill-text");
+    if (!pill || inflight.size) return;
+    text.textContent = "slow: " + r.method + " " + r.path + " took " + fmtMs(r.ms);
+    pill.className = ""; pill.hidden = false; pill.querySelector(".spin").hidden = true;
+    clearTimeout(pillHold);
+    pillHold = setTimeout(() => { pillHold = null; showActivity(); }, 4000);
+  }
+
+  // ---- The loading screen itself -------------------------------------------
+  function connectionLine() {
+    const host = location.hostname;
+    const direct = /^(\\d+\\.){3}\\d+$/.test(host) || host === "localhost";
+    const route = direct ? (host.startsWith("100.") ? "direct over the tailnet" : "direct on the local network")
+                         : "through Cloudflare (" + host + ")";
+    const net = navigator.connection && navigator.connection.effectiveType ? " · network " + navigator.connection.effectiveType : "";
+    return location.pathname + " · " + route + net;
+  }
+  function navigationSteps() {
+    const nav = performance.getEntriesByType("navigation")[0];
+    if (!nav) { step("nav", "Page received", "no navigation timing in this browser"); settle("nav", "info", null); return; }
+    const dns = nav.domainLookupEnd - nav.domainLookupStart;
+    const tcp = nav.connectEnd - nav.connectStart;
+    const tls = nav.secureConnectionStart > 0 ? nav.connectEnd - nav.secureConnectionStart : 0;
+    const wait = nav.responseStart - nav.requestStart;
+    const orin = serverMs(nav);
+    const reused = tcp <= 0 && dns <= 0;
+    step("conn", "Connected", reused ? "reused an open connection"
+      : "DNS " + fmtMs(dns) + " · TCP " + fmtMs(Math.max(0, tcp - tls)) + (tls ? " · TLS " + fmtMs(tls) : ""));
+    settle("conn", "ok", reused ? 0 : nav.connectEnd - nav.startTime);
+    step("ttfb", "Orin built the page", orin != null
+      ? "server " + fmtMs(orin) + " · network and tunnel " + fmtMs(Math.max(0, wait - orin))
+      : "first byte after " + fmtMs(wait));
+    settle("ttfb", "ok", wait);
+    const size = nav.encodedBodySize || nav.transferSize;
+    step("dl", "Page downloaded", nav.transferSize === 0 && nav.encodedBodySize > 0 ? "from browser cache" : fmtKB(size));
+    settle("dl", "ok", nav.responseEnd - nav.responseStart);
+  }
+  function parsedStep() {
+    const nav = performance.getEntriesByType("navigation")[0];
+    step("dom", "Page parsed", document.querySelectorAll("*").length + " elements");
+    // Called from DOMContentLoaded itself, when the browser has not yet
+    // stamped domContentLoadedEventEnd - so measure to now.
+    settle("dom", "ok", Math.max(0, performance.now() - (nav ? nav.responseEnd : T0)));
+  }
+  function assetSteps() {
+    const assets = performance.getEntriesByType("resource")
+      .filter((e) => e.initiatorType === "script" || e.initiatorType === "link" || e.initiatorType === "css");
+    if (!assets.length) return;
+    const slowest = Math.max(...assets.map((e) => e.duration));
+    step("assets", "Scripts and styles", assets.length + " file(s): " +
+         assets.map((e) => shortPath(e.name).split("/").pop()).join(", "));
+    settle("assets", "ok", slowest);
+  }
+  const images = [];
+  function watchImages() {
+    const visible = [...document.images].filter((img) => {
+      if (img.loading !== "lazy") return true;
+      const box = img.getBoundingClientRect();
+      return box.top < innerHeight && box.bottom > 0;
+    });
+    if (!visible.length) return;
+    images.push(...visible);
+    const started = performance.now();
+    const update = () => {
+      const done = images.filter((img) => img.complete).length;
+      const broken = images.filter((img) => img.complete && img.naturalWidth === 0).length;
+      step("img", "Images", done + " of " + images.length + " on screen" + (broken ? " · " + broken + " failed" : ""));
+      if (done === images.length) { settle("img", broken ? "fail" : "ok", performance.now() - started); maybeBootDone(); }
+    };
+    images.forEach((img) => { if (!img.complete) { img.addEventListener("load", update); img.addEventListener("error", update); } });
+    update();
+  }
+  let loadFired = false;
+  function maybeBootDone() {
+    if (booted || !loadFired) return;
+    if (steps.some((s) => s.state === "run")) return;
+    completeBoot(false);
+  }
+  function completeBoot(timedOut) {
+    if (booted) return;
+    booted = true;
+    bootDone = performance.now();   // performance.now() counts from the navigation's start
+    step("ready", timedOut ? "Shown before everything finished" : "Ready",
+         timedOut ? "some requests are still running; they continue in the background" : "");
+    settle("ready", timedOut ? "info" : "ok", performance.now());
+    const badge = document.querySelector(".tv-loadbadge b");
+    if (badge) badge.textContent = fmtMs(performance.now());
+    // ...#activity on the URL keeps the log open instead (handy for sharing
+    // what a slow load looked like).
+    setTimeout(() => (location.hash === "#activity" ? openLog() : hideOverlay()), timedOut ? 900 : 350);
+  }
+  function hideOverlay() {
+    const boot = $("tv-boot");
+    if (!boot || mode === "nav") return;
+    boot.classList.add("fade");
+    setTimeout(() => { if (mode !== "nav" && mode !== "log") { boot.hidden = true; boot.classList.remove("fade"); mode = "hidden"; } }, 380);
+  }
+  let elapsedTimer = null;
+  function tickElapsed(from) {
+    clearInterval(elapsedTimer);
+    elapsedTimer = setInterval(() => {
+      const el = $("tv-boot-elapsed");
+      if (el && (mode === "boot" || mode === "nav")) el.textContent = fmtMs(performance.now() - from);
+      if (mode === "hidden") clearInterval(elapsedTimer);
+    }, 100);
+  }
+
+  // ---- Leaving the page: show it from the very first moment ---------------
+  function showNavigating(target, label) {
+    const boot = $("tv-boot");
+    if (!boot) return;
+    mode = "nav";
+    steps.length = 0;
+    $("tv-boot-title").textContent = label;
+    $("tv-boot-where").textContent = target + " · waiting for the Orin to answer";
+    $("tv-boot-close").hidden = true;
+    step("req", "Request sent", "the next page appears as soon as its first byte arrives");
+    boot.hidden = false; boot.classList.remove("fade");
+    render(); tickElapsed(performance.now());
+  }
+  document.addEventListener("click", (event) => {
+    if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    const a = event.target.closest && event.target.closest("a[href]");
+    if (!a || a.target === "_blank" || a.hasAttribute("download")) return;
+    const url = new URL(a.href, location.href);
+    if (url.origin !== location.origin || (url.pathname === location.pathname && url.hash)) return;
+    if (url.pathname.indexOf("/media/") >= 0 || url.pathname.indexOf("/api/") >= 0) return;
+    showNavigating(url.pathname + url.search, "Loading " + (a.textContent.trim() || url.pathname).slice(0, 40));
+  });
+  window.addEventListener("beforeunload", () => { if (mode !== "nav") showNavigating(location.pathname, "Reloading"); });
+  window.addEventListener("pageshow", (event) => {
+    if (event.persisted) { mode = "hidden"; const boot = $("tv-boot"); if (boot) boot.hidden = true; }
+  });
+
+  // ---- The log view (footer badge) -----------------------------------------
+  function openLog() {
+    const boot = $("tv-boot");
+    if (!boot) return;
+    mode = "log";
+    $("tv-boot-title").textContent = "Activity log";
+    $("tv-boot-where").textContent = connectionLine() + " · page ready after " + fmtMs(bootDone || 0) +
+                                     " · " + log.length + " request(s) since";
+    $("tv-boot-elapsed").textContent = "";
+    $("tv-boot-close").hidden = false;
+    $("tv-boot-foot").textContent = "Faded rows are the automatic 5-second refreshes. Esc or ✕ to close.";
+    boot.hidden = false; boot.classList.remove("fade");
+    render();
+  }
+  function closeLog() {
+    if (mode !== "log") return;
+    mode = "hidden"; $("tv-boot").hidden = true;
+  }
+  window.tvActivity = {open: openLog, log};
+
+  document.addEventListener("DOMContentLoaded", () => {
+    $("tv-boot-where").textContent = connectionLine();
+    tickElapsed(0);
+    navigationSteps();
+    parsedStep();
+    $("tv-boot-close").addEventListener("click", closeLog);
+    $("tv-pill").addEventListener("click", openLog);
+    $("tv-boot").addEventListener("click", (event) => { if (event.target.id === "tv-boot") closeLog(); });
+    document.addEventListener("keydown", (event) => { if (event.key === "Escape") closeLog(); });
+    for (const badge of document.querySelectorAll(".tv-loadbadge")) badge.addEventListener("click", openLog);
+    watchImages();
+  });
+  window.addEventListener("load", () => {
+    loadFired = true;
+    assetSteps();
+    // Requests a page fires right on load get a moment to start.
+    setTimeout(maybeBootDone, 60);
+  });
+  // Never hold the page hostage: after 8 s, show it regardless.
+  setTimeout(() => { if (!booted) { loadFired = true; completeBoot(true); } }, 8000);
+})();
+</script>
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -1156,11 +1626,13 @@ def render_page(title: str, body: str, active_path: str = "", head_extra: str = 
   <meta charset="utf-8" />
   <title>{esc(title)} - Tesla Vision</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>{PAGE_STYLES}</style>
+  <style>{PAGE_STYLES}{ACTIVITY_STYLES}</style>
   <script>var URL_ROOT = {url_root_js};</script>
+  {ACTIVITY_SCRIPT}
   {head_extra}
 </head>
 <body>
+  {ACTIVITY_HTML}
   <header><nav>
     <span class="brand">🛰️ Tesla Vision</span>
     {tabs}
@@ -1174,6 +1646,7 @@ def render_page(title: str, body: str, active_path: str = "", head_extra: str = 
     <div class="inner" id="sysbar">
       <span class="label">Orin box</span>
       {sysbar}
+      <span class="metric tv-loadbadge" title="Open the loading and activity log">⚡ Loaded in <b>…</b></span>
     </div>
   </footer>
   {SYSBAR_SCRIPT}
@@ -4971,6 +5444,39 @@ def findmy_view():
     return page
 
 
+# Building a PlateReader loads the YOLO plate model - 3.5 s on the Orin -
+# and the Settings page only wants its one-line status. Cached per process,
+# refreshed after STAGE_STATUS_TTL_SECONDS, and warmed in the background at
+# startup so even the first visit does not pay for it.
+STAGE_STATUS_TTL_SECONDS = 600
+_stage_status_cache: dict[str, tuple[float, str]] = {}
+
+
+def _load_stage_status(stage: str) -> str:
+    if stage == "alpr":
+        from src.alpr import PlateReader
+        return PlateReader().status_text()
+    from src.faces import FaceEngine
+    return FaceEngine().status_text()
+
+
+def cached_stage_status(stage: str) -> str:
+    cached = _stage_status_cache.get(stage)
+    if cached and time.time() - cached[0] < STAGE_STATUS_TTL_SECONDS:
+        return cached[1]
+    text = _load_stage_status(stage)
+    _stage_status_cache[stage] = (time.time(), text)
+    return text
+
+
+def _warm_stage_status() -> None:
+    for stage in ("alpr", "faces"):
+        try:
+            cached_stage_status(stage)
+        except Exception as error:                       # noqa: BLE001
+            print(f"[⚙️ ui] could not pre-load {stage} status: {error}", flush=True)
+
+
 @app.get("/settings", response_class=HTMLResponse)
 def settings_view():
     """
@@ -4990,12 +5496,10 @@ def settings_view():
             return f"error: {exception_object}"
 
     def alpr_status():
-        from src.alpr import PlateReader
-        return PlateReader().status_text()
+        return cached_stage_status("alpr")
 
     def face_status():
-        from src.faces import FaceEngine
-        return FaceEngine().status_text()
+        return cached_stage_status("faces")
 
     def tesla_status():
         from src.poller import TeslaFleetClient

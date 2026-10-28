@@ -806,6 +806,42 @@ def test_a_running_demo_counts_on_its_own_clock():
 
 
 # ---------------------------------------------------------------------------
+# Activity layer
+# ---------------------------------------------------------------------------
+def test_every_page_carries_the_loading_screen_and_activity_layer():
+    for path in ("/", "/plates", "/timeline", "/settings"):
+        status, _, body = render(path)
+        assert status == 200, (path, status)
+        for marker in ('id="tv-boot"', 'id="tv-bar"', 'id="tv-pill"', "window.fetch = function",
+                       'class="metric tv-loadbadge"', "<noscript><style>#tv-boot"):
+            assert marker in body, (path, marker)
+        # The fetch wrapper must be installed before any page script runs.
+        assert body.index("window.fetch = function") < body.index("<main>"), path
+
+
+def test_every_response_says_how_long_the_orin_took():
+    for path in ("/healthz", "/plates", "/api/system"):
+        _, headers, _ = render(path)
+        timing = headers.get("server-timing", "")
+        assert timing.startswith("app;dur="), (path, headers)
+        assert float(timing.split("dur=")[1].split(";")[0]) >= 0
+
+
+def test_the_settings_page_does_not_reload_the_plate_model_every_visit():
+    calls = []
+    original = ui_app._load_stage_status
+    ui_app._load_stage_status = lambda stage: calls.append(stage) or f"{stage}: ready"
+    ui_app._stage_status_cache.clear()
+    try:
+        for _ in range(3):
+            assert render("/settings")[0] == 200
+        assert sorted(calls) == ["alpr", "faces"], calls
+    finally:
+        ui_app._load_stage_status = original
+        ui_app._stage_status_cache.clear()
+
+
+# ---------------------------------------------------------------------------
 def main() -> int:
     tests = [
         value for name, value in sorted(globals().items())
