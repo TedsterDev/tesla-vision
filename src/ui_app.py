@@ -476,6 +476,10 @@ PAGE_STYLES = """
                             font-variant-numeric:tabular-nums; }
   footer.sysbar .metric.warn b { color:var(--medium); }
   footer.sysbar .metric.high b { color:var(--high); }
+  footer.sysbar .metric.good b { color:var(--low); }
+  footer.sysbar .inner + .inner { margin-top:6px; }
+  .pipeline-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:14px; }
+  .pipeline-grid table td { padding:5px 8px; font-size:13px; }
 """
 
 NAV_TABS = [
@@ -619,6 +623,86 @@ def system_stats() -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Pipeline status (the queue, and how far behind the processor is)
+# ---------------------------------------------------------------------------
+# The processor rewrites logs/processor.json when a clip starts, when it ends
+# and every 5 s while idle; ingest writes logs/ingest.json every pass. Neither
+# goes through sqlite, for the reason _read_gps_heartbeat gives.
+
+# A heartbeat this old while idle means the processor is not running.
+PIPELINE_IDLE_STALE_SECONDS = 60
+# One clip taking this long means it is wedged, not slow: the worst case, a
+# 5 MP clip on the CPU fallback, is a couple of minutes.
+PIPELINE_CLIP_STUCK_SECONDS = 900
+
+
+def _read_json(path: Path) -> dict[str, Any] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def pipeline_status() -> dict[str, Any]:
+    from src.common import INBOX_DIR, LOGS_DIR
+    from src import clipqueue
+
+    now = time.time()
+    beat = _read_json(LOGS_DIR / "processor.json")
+    ingest = _read_json(LOGS_DIR / "ingest.json")
+
+    # The queue is read live from inbox/ rather than taken from the
+    # heartbeat: it is what is actually waiting, even mid-clip.
+    entries = clipqueue.queue_entries(INBOX_DIR)
+    current_name = ((beat or {}).get("current") or {}).get("name")
+    pending = [entry for entry in entries if entry["name"] != current_name]
+
+    result: dict[str, Any] = {"ts": int(now), "queue": clipqueue.summarize(pending, now)}
+
+    if beat is None:
+        result.update(state="unknown", detail="the processor has not reported yet")
+    else:
+        age = now - (beat.get("ts") or 0)
+        current = beat.get("current")
+        if current:
+            current = dict(current)
+            current["elapsed_seconds"] = round(now - (current.get("started_ts") or now), 1)
+        if current and current["elapsed_seconds"] > PIPELINE_CLIP_STUCK_SECONDS:
+            state, detail = "stuck", f"one clip has run {int(current['elapsed_seconds'])}s"
+        elif not current and age > PIPELINE_IDLE_STALE_SECONDS:
+            state, detail = "down", f"no heartbeat for {int(age)}s"
+        elif current:
+            state, detail = "processing", None
+        else:
+            state, detail = ("queued", "waiting for the next pass") if pending else ("idle", None)
+        by_camera = beat.get("seconds_by_camera") or {}
+        overall = (sum(by_camera.values()) / len(by_camera)) if by_camera else None
+        result.update(
+            state=state, detail=detail, heartbeat_age_seconds=int(age),
+            current=current,
+            eta_seconds=clipqueue.estimate_seconds(pending, by_camera, overall),
+            **{key: beat.get(key) for key in (
+                "device", "has_gpu", "gpu_failures", "cpu_fallbacks", "gpu_retry_after",
+                "last_gpu_error", "realtime_factor", "seconds_by_camera", "last", "recent",
+                "processed_total", "errors_total", "last_error", "started_ts",
+            )},
+        )
+
+    if ingest is None:
+        result["ingest"] = {"state": "unknown", "reason": "ingest has not reported"}
+    else:
+        result["ingest"] = {
+            "state": ingest.get("state"), "reason": ingest.get("reason"),
+            "age_seconds": int(now - (ingest.get("last_pass_ts") or 0)),
+            "copied_total": ingest.get("copied_total"), "last_copied": ingest.get("last_copied"),
+        }
+
+    # Path objects do not serialise; the queue summary only carries names.
+    return result
+
+
 # Plain string, not an f-string: it is JavaScript, and doubling every brace
 # would make it unreadable. Fills the footer render_page emits and refreshes
 # it every 5 s; a failed fetch leaves the last figures and dims the bar.
@@ -667,9 +751,103 @@ SYSBAR_SCRIPT = """
   }
   refresh();
   setInterval(refresh, 5000);
+
+  // ---- Pipeline: the queue and how far behind the processor is ----------
+  const pipe = document.getElementById("pipebar");
+  const card = document.getElementById("pipeline-card");
+  const STATE_CLASS = {processing: "good", idle: "", queued: "warn", down: "high",
+                       stuck: "high", unknown: "warn"};
+  function putPipe(key, text, cls, title) {
+    const el = pipe.querySelector('[data-k="' + key + '"]');
+    if (!el) return;
+    el.className = "metric " + (cls || "");
+    el.querySelector("b").textContent = text;
+    el.title = title || "";
+  }
+  function clipTime(ts) {
+    if (ts == null) return "?";
+    const when = new Date(ts * 1000), age = Date.now() / 1000 - ts;
+    return age < 86400 ? when.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"})
+                       : when.toLocaleString([], {month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"});
+  }
+  function ago(seconds) {
+    if (seconds == null) return "–";
+    if (seconds < 90) return Math.max(0, Math.round(seconds)) + "s ago";
+    return duration(seconds) + " ago";
+  }
+  function cameraLabel(c) { return (c || "?").replace("_", " "); }
+  function row(cells) {
+    const tr = document.createElement("tr");
+    for (const [text, cls] of cells) {
+      const td = document.createElement("td");
+      td.textContent = text;
+      if (cls) td.className = cls;
+      tr.appendChild(td);
+    }
+    return tr;
+  }
+  function fill(tbody, rows, empty) {
+    tbody.replaceChildren(...(rows.length ? rows : [row([[empty, "muted"]])]));
+  }
+  async function refreshPipeline() {
+    let p;
+    try {
+      p = await (await fetch(URL_ROOT + "/api/pipeline", {cache: "no-store"})).json();
+    } catch (error) {
+      pipe.style.opacity = 0.5;
+      return;
+    }
+    pipe.style.opacity = 1;
+    const q = p.queue || {depth: 0, events: 0, next: []};
+    putPipe("pstate", "● " + p.state, STATE_CLASS[p.state] || "", p.detail || "");
+    if (p.current) {
+      putPipe("pnow", cameraLabel(p.current.camera) + " " + clipTime(p.current.captured_ts) +
+              " · " + Math.round(p.current.elapsed_seconds) + "s", "");
+    } else {
+      putPipe("pnow", "–", "");
+    }
+    putPipe("pqueue", q.depth + (q.events ? " (" + q.events + " events)" : ""),
+            q.depth > 30 ? "high" : q.depth > 6 ? "warn" : "");
+    putPipe("peta", q.depth === 0 ? "clear" : p.eta_seconds != null ? "~" + duration(Math.max(60, p.eta_seconds)) : "?",
+            p.eta_seconds > 900 ? "high" : p.eta_seconds > 120 ? "warn" : "");
+    const gpuResting = p.gpu_retry_after && p.gpu_retry_after * 1000 > Date.now();
+    const device = p.device === "cuda" ? "GPU" : p.has_gpu ? "CPU (GPU resting)" : "CPU";
+    putPipe("pspeed", (p.realtime_factor != null ? p.realtime_factor.toFixed(2) + "× real time · " : "") + device,
+            gpuResting ? "warn" : p.realtime_factor == null ? "" : p.realtime_factor < 0.9 ? "good" : p.realtime_factor < 1 ? "warn" : "high",
+            (p.last_gpu_error ? "last GPU error: " + p.last_gpu_error + ". " : "") +
+            (p.cpu_fallbacks ? p.cpu_fallbacks + " clip(s) re-run on the CPU" : ""));
+    putPipe("pfresh", p.last ? clipTime(p.last.captured_ts) : "–", "");
+    const ingest = p.ingest || {};
+    putPipe("pingest", ingest.state === "ready" ? "copying" : (ingest.state || "?"),
+            ingest.state === "ready" ? "good" : "", ingest.reason || "");
+
+    if (!card) return;
+    const headline = document.getElementById("pipeline-headline");
+    headline.textContent = q.depth === 0
+      ? "Caught up" + (p.last ? " · newest footage analysed " + clipTime(p.last.captured_ts) : "")
+      : q.depth + " waiting" + (p.eta_seconds != null ? ", clears in ~" + duration(Math.max(60, p.eta_seconds)) : "");
+    fill(document.getElementById("pipeline-next"), (q.next || []).map((clip) => row([
+      [clipTime(clip.captured_ts)], [cameraLabel(clip.camera)],
+      [clip.source ? clip.source.replace("Clips", "") : "", clip.source && clip.source !== "RecentClips" ? "pill medium" : "muted"],
+    ])), "Nothing waiting");
+    fill(document.getElementById("pipeline-recent"), (p.recent || []).map((clip) => row([
+      [clipTime(clip.captured_ts)], [cameraLabel(clip.camera)],
+      [clip.seconds + "s " + (clip.device === "cuda" ? "GPU" : "CPU"), clip.device === "cuda" ? "" : "muted"],
+      [clip.alert ? "alert" : "", clip.alert ? "pill high" : ""],
+    ])), "Nothing yet since the processor started");
+  }
+  if (pipe) {
+    refreshPipeline();
+    setInterval(refreshPipeline, 5000);
+  }
 })();
 </script>
 """
+
+PIPELINE_METRICS = [
+    ("pstate", "Pipeline"), ("pnow", "Now"), ("pqueue", "Queue"), ("peta", "Clears in"),
+    ("pspeed", "Speed"), ("pfresh", "Newest done"), ("pingest", "Ingest"),
+]
 
 SYSBAR_METRICS = [
     ("cpu", "CPU"), ("gpu", "GPU"), ("mem", "RAM"), ("swap", "Swap"),
@@ -690,6 +868,10 @@ def render_page(title: str, body: str, active_path: str = "", head_extra: str = 
         f'<span class="metric" data-k="{key}">{label} <b>–</b></span>'
         for key, label in SYSBAR_METRICS
     )
+    pipebar = "".join(
+        f'<span class="metric" data-k="{key}">{"" if key == "pstate" else label + " "}<b>–</b></span>'
+        for key, label in PIPELINE_METRICS
+    )
 
     return HTMLResponse(f"""<!doctype html>
 <html><head>
@@ -706,10 +888,16 @@ def render_page(title: str, body: str, active_path: str = "", head_extra: str = 
     {tabs}
   </nav></header>
   <main>{body}</main>
-  <footer class="sysbar"><div class="inner" id="sysbar">
-    <span class="label">Orin box</span>
-    {sysbar}
-  </div></footer>
+  <footer class="sysbar">
+    <div class="inner" id="pipebar">
+      <span class="label">Pipeline</span>
+      {pipebar}
+    </div>
+    <div class="inner" id="sysbar">
+      <span class="label">Orin box</span>
+      {sysbar}
+    </div>
+  </footer>
   {SYSBAR_SCRIPT}
 </body></html>""")
 
@@ -750,6 +938,11 @@ def _list_alerts() -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # JSON API - mirrors Scout's app/server/routes/api/*
 # ---------------------------------------------------------------------------
+
+@app.get("/api/pipeline")
+def api_pipeline():
+    return pipeline_status()
+
 
 @app.get("/api/system")
 def api_system():
@@ -1151,6 +1344,16 @@ def index(limit: int = 25):
       <h1>Recent activity</h1>
       <div class="sub">Newest detections from the TeslaCam feed.</div>
       {banner}
+      <div class="card" id="pipeline-card">
+        <div style="font-weight:800; margin-bottom:8px;">Processing queue
+          <span class="muted" id="pipeline-headline" style="font-weight:400; margin-left:8px;"></span></div>
+        <div class="pipeline-grid">
+          <div><div class="muted" style="margin-bottom:4px;">Up next (Sentry/Saved first, then newest)</div>
+            <table><tbody id="pipeline-next"><tr><td class="muted">–</td></tr></tbody></table></div>
+          <div><div class="muted" style="margin-bottom:4px;">Just processed</div>
+            <table><tbody id="pipeline-recent"><tr><td class="muted">–</td></tr></tbody></table></div>
+        </div>
+      </div>
       <div class="row" style="margin-bottom:20px;">{stat_tiles}</div>
       {"".join(rows) if rows else '<div class="empty">No alerts yet.</div>'}
       {more_link}

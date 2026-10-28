@@ -26,10 +26,12 @@ than burning it all in the first second. Tune with ALPR_MAX_FRAMES /
 FACE_MAX_FRAMES if you move to an L4T base image with GPU inference.
 """
 import json
+import os
 import shutil
 import time
 import uuid
 
+from collections import deque
 from pathlib import Path
 
 # Open source computer vision imports
@@ -46,13 +48,15 @@ from src.common import (
     TESLACAM_DIR,
     PROCESSED_DIR,
     INBOX_DIR,
+    LOGS_DIR,
     GIF_QUEUE_DIR,
     ALERTS_DIR,
     MEDIA_DIR,
     PLATE_CROPS_DIR,
 )
 from src.clipmeta import detect_clip_source, describe_clip, parse_clip_filename
-from src.ingest import iterate_new_clips, safe_copy_to_inbox
+from src.clipqueue import CLIP_SECONDS, discard_source, estimate_seconds, queue_entries, read_source, summarize
+from src.ingest import iterate_new_clips, safe_copy_to_inbox, write_heartbeat
 from src.db import connect, now_ts, upsert
 from src.poller import location_at
 
@@ -110,10 +114,21 @@ SAMPLE_FRAMES_PER_CLIP = env_int("SAMPLE_FRAMES_PER_CLIP", 30)
 SAMPLE_MAX_SECONDS = env_int("SAMPLE_MAX_SECONDS", 0)
 
 # A Tesla writes one-minute clips from four to six cameras simultaneously, so
-# live ingest produces 4-6 clips per minute. At a 30-frame budget we process
-# about 1.5-2 clips per minute, i.e. we fall behind a continuously-recording
-# car. Drop SAMPLE_FRAMES_PER_CLIP to 10 for roughly real-time throughput, or
-# move to an l4t-pytorch base image to run YOLO on the GPU.
+# live ingest produces 4-6 clips per minute. With YOLO on the GPU and seeking
+# (below), a minute of six-camera footage costs ~38 s at this budget - about
+# 0.63x real time, so the queue keeps up with a recording car. The dashboard
+# footer shows the live figure.
+
+# Below this many frames between samples, seeking (which decodes forward from
+# the previous keyframe each time) costs more than reading straight through.
+SEEK_MIN_STEP = env_int("SEEK_MIN_STEP", 15)
+
+# What the processor is doing and how far behind it is; read by the dashboard.
+STATUS_PATH = LOGS_DIR / "processor.json"
+
+# After the GPU fails a clip (shared-memory exhaustion on an 8 GB Orin), run
+# on the CPU for this long before trying the GPU again.
+GPU_RETRY_SECONDS = env_int("GPU_RETRY_SECONDS", 300)
 
 # The general-purpose COCO detector that finds people and vehicles. Staged in
 # MODELS_DIR by scripts/fetch_models.sh so it is present offline.
@@ -147,7 +162,7 @@ def register_clip(connection, clip_path: Path, source_path: Path | None = None) 
         "filename": clip_path.name,
         "camera": metadata["camera"],
         "captured_ts": metadata["captured_ts"],
-        "clip_source": detect_clip_source(source_path or clip_path),
+        "clip_source": read_source(clip_path) or detect_clip_source(source_path or clip_path),
         "ingested_ts": now_ts(),
         "processed_ts": None,
         "status": "ingested",
@@ -201,17 +216,43 @@ def sample_frames(
 
     step = max(1, available // max(frame_budget, 1)) if available else int(round(fps))
 
+    if available and step >= SEEK_MIN_STEP:
+        # Seek straight to each sampled frame. Decoding was the most expensive
+        # stage once YOLO moved to the GPU: reading every frame of a 60 s clip
+        # to keep 1 in 70 took 28.8 s for the 5 MP front camera and 7.7 s for
+        # a side camera; seeking takes 5.3 s and 2.3 s. Checked against the
+        # read-everything frames on this car's footage: every seeked frame is
+        # a clean decoded frame, at most one frame (33 ms) from the requested
+        # index - irrelevant for "was this vehicle present this minute".
+        yielded = 0
+        for frame_number in range(0, available, step):
+            if yielded >= frame_budget:
+                break
+            video_capture.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+            ok, frame = video_capture.read()
+            if not ok:
+                break
+            yield frame_number, frame
+            yielded += 1
+        video_capture.release()
+        return
+
+    # Sequential: frames too close together for a seek (each one decodes from
+    # the previous keyframe) or a container with no frame count. grab()
+    # advances without the colour conversion read() pays on every frame.
     frame_number = 0
     yielded = 0
     while yielded < frame_budget:
-        ok, frame = video_capture.read()
-        if not ok:
-            break
         if available and frame_number >= available:
             break
         if frame_number % step == 0:
+            ok, frame = video_capture.read()
+            if not ok:
+                break
             yield frame_number, frame
             yielded += 1
+        elif not video_capture.grab():
+            break
 
         frame_number += 1
 
@@ -238,7 +279,8 @@ class ClipAnalysis:
         return sum(1 for hit in self.hits if hit["class_id"] in VEHICLE_CLASS_IDS)
 
 
-def analyze_clip(model: YOLO, video_path: Path, plate_reader=None, face_engine=None) -> ClipAnalysis:
+def analyze_clip(model: YOLO, video_path: Path, plate_reader=None, face_engine=None,
+                 device: str | None = None) -> ClipAnalysis:
     """
     Run every enabled detector over one clip in a single pass.
 
@@ -266,7 +308,7 @@ def analyze_clip(model: YOLO, video_path: Path, plate_reader=None, face_engine=N
             scale = 1.0
             frame_small = frame
 
-        results = model(frame_small, verbose=False)
+        results = model(frame_small, verbose=False, **({"device": device} if device else {}))
         single_frame_result = results[0]
         if single_frame_result.boxes is None:
             continue
@@ -591,6 +633,305 @@ def load_coco_model() -> YOLO:
     return YOLO(COCO_MODEL_FILENAME)
 
 
+def is_gpu_failure(error: BaseException) -> bool:
+    """
+    True for the ways a CUDA allocation fails on the Orin.
+
+    Its 8 GB is shared by CPU and GPU, so under memory pressure an allocation
+    fails mid-clip. On Jetson that surfaces as several different exceptions -
+    a CUDA OOM, CUBLAS_STATUS_ALLOC_FAILED, or an NVML assert (PyTorch tries
+    to query NVML, which Jetson lacks, while reporting the OOM) - so match
+    on text rather than on one type.
+    """
+    text = f"{type(error).__name__}: {error}"
+    return any(marker in text for marker in (
+        "CUDA", "CUBLAS", "CUDNN", "cuDNN", "NVML_SUCCESS", "out of memory", "OutOfMemory",
+    ))
+
+
+class Detectors:
+    """
+    The models analyze_clip needs, on the GPU while it is willing.
+
+    When the GPU fails a clip, that clip is re-run on CPU copies of the two
+    YOLO models (built on first need, then kept) and the GPU is rested for
+    GPU_RETRY_SECONDS. Before this, the clip was moved aside as error_* and
+    never analysed. The face engine is OpenCV on the CPU either way.
+    """
+
+    def __init__(self, model, plate_reader, face_engine) -> None:
+        import torch
+        self.model = model
+        self.plate_reader = plate_reader
+        self.face_engine = face_engine
+        self.has_gpu = torch.cuda.is_available()
+        self.gpu_retry_after = 0.0
+        self.gpu_failures = 0
+        self.cpu_fallbacks = 0
+        self.last_gpu_error = None
+        self._cpu_model = None
+        self._cpu_plate_reader = None
+
+    @property
+    def device(self) -> str:
+        return "cuda" if self.has_gpu and time.time() >= self.gpu_retry_after else "cpu"
+
+    def analyze(self, clip: Path) -> tuple[ClipAnalysis, str]:
+        if not self.has_gpu:
+            return analyze_clip(self.model, clip, self.plate_reader, self.face_engine), "cpu"
+
+        if self.device == "cuda":
+            try:
+                return analyze_clip(self.model, clip, self.plate_reader, self.face_engine), "cuda"
+            except Exception as error:
+                if not is_gpu_failure(error):
+                    raise
+                self.gpu_failures += 1
+                self.last_gpu_error = str(error).splitlines()[0][:200]
+                self.gpu_retry_after = time.time() + GPU_RETRY_SECONDS
+                print(f"[⚙️ processor] GPU failed on {clip.name} ({self.last_gpu_error}); "
+                      f"re-running on the CPU, GPU rested {GPU_RETRY_SECONDS}s", flush=True)
+                try:
+                    import torch
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+
+        self.cpu_fallbacks += 1
+        model, plate_reader = self._cpu_detectors()
+        return analyze_clip(model, clip, plate_reader, self.face_engine, device="cpu"), "cpu"
+
+    def _cpu_detectors(self):
+        if self._cpu_model is None:
+            self._cpu_model = load_coco_model()
+            if self.plate_reader is not None:
+                from src.alpr import PlateReader
+                self._cpu_plate_reader = PlateReader(device="cpu")
+        return self._cpu_model, self._cpu_plate_reader
+
+
+def clip_duration_seconds(clip: Path) -> float:
+    capture = cv2.VideoCapture(str(clip))
+    try:
+        fps = capture.get(cv2.CAP_PROP_FPS) or 0
+        frames = capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+    finally:
+        capture.release()
+    return frames / fps if fps > 0 and frames > 0 else float(CLIP_SECONDS)
+
+
+class PipelineStatus:
+    """
+    logs/processor.json: what the processor is doing and how far behind it is.
+
+    Written atomically (ingest's write_heartbeat) when a clip starts, when it
+    ends, and every few seconds while idle, so the dashboard can tell "idle,
+    nothing to do" from "dead" by the heartbeat's age - the same contract as
+    gps.json and ingest.json.
+    """
+
+    IDLE_WRITE_SECONDS = 5
+    WINDOW = 30   # recent clips the speed figures are averaged over
+
+    def __init__(self, detectors: Detectors) -> None:
+        self.detectors = detectors
+        self.started_ts = int(time.time())
+        self.recent: deque[dict] = deque(maxlen=self.WINDOW)
+        self.current: dict | None = None
+        self.processed_total = 0
+        self.errors_total = 0
+        self.last_error: str | None = None
+        self.last_written = 0.0
+
+    def begin(self, entry: dict, pending: list[dict]) -> None:
+        self.current = {
+            "name": entry["name"], "camera": entry["camera"],
+            "captured_ts": entry["captured_ts"], "source": entry["source"],
+            "started_ts": time.time(), "device": self.detectors.device,
+        }
+        self.write(pending, force=True)
+
+    def finish(self, entry: dict, seconds: float, footage_seconds: float, device: str,
+               alerted: bool, pending: list[dict]) -> None:
+        self.processed_total += 1
+        self.recent.append({
+            "name": entry["name"], "camera": entry["camera"],
+            "captured_ts": entry["captured_ts"], "source": entry["source"],
+            "seconds": round(seconds, 1), "footage_seconds": round(footage_seconds, 1),
+            "device": device, "alert": alerted, "finished_ts": int(time.time()),
+        })
+        self.current = None
+        self.write(pending, force=True)
+
+    def fail(self, entry: dict, message: str, pending: list[dict]) -> None:
+        self.errors_total += 1
+        self.last_error = f"{entry['name']}: {message}"[:300]
+        self.current = None
+        self.write(pending, force=True)
+
+    def seconds_by_camera(self) -> dict[str, float]:
+        totals: dict[str, list[float]] = {}
+        for clip in self.recent:
+            totals.setdefault(clip["camera"] or "", []).append(clip["seconds"])
+        return {camera: sum(values) / len(values) for camera, values in totals.items()}
+
+    def realtime_factor(self) -> float | None:
+        """
+        Processing time per minute of driving, over a minute.
+
+        Below 1.0 the queue keeps up with a recording car. "A minute of
+        driving" is one clip per camera, so this multiplies the mean cost of
+        a clip by how many cameras are recording.
+        """
+        if not self.recent:
+            return None
+        cameras = len({clip["camera"] for clip in self.recent}) or 1
+        seconds = sum(clip["seconds"] for clip in self.recent) / len(self.recent)
+        footage = sum(clip["footage_seconds"] for clip in self.recent) / len(self.recent)
+        return round(seconds * cameras / footage, 2) if footage > 0 else None
+
+    def write(self, pending: list[dict], force: bool = False) -> None:
+        now = time.time()
+        if not force and now - self.last_written < self.IDLE_WRITE_SECONDS:
+            return
+        self.last_written = now
+
+        by_camera = self.seconds_by_camera()
+        overall = (sum(clip["seconds"] for clip in self.recent) / len(self.recent)) if self.recent else None
+        last = self.recent[-1] if self.recent else None
+        newest_done = max((clip["captured_ts"] for clip in self.recent
+                           if clip["captured_ts"] is not None), default=None)
+        current = dict(self.current) if self.current else None
+        if current:
+            current["elapsed_seconds"] = round(now - current["started_ts"], 1)
+
+        payload = {
+            "schema": 1,
+            "pid": os.getpid(),
+            "ts": int(now),
+            "started_ts": self.started_ts,
+            "state": "processing" if current else ("queued" if pending else "idle"),
+            "device": self.detectors.device,
+            "has_gpu": self.detectors.has_gpu,
+            "gpu_failures": self.detectors.gpu_failures,
+            "cpu_fallbacks": self.detectors.cpu_fallbacks,
+            "gpu_retry_after": int(self.detectors.gpu_retry_after) or None,
+            "last_gpu_error": self.detectors.last_gpu_error,
+            "current": current,
+            "queue": summarize(pending, now),
+            "eta_seconds": estimate_seconds(pending, by_camera, overall),
+            "realtime_factor": self.realtime_factor(),
+            "seconds_by_camera": {camera: round(value, 1) for camera, value in by_camera.items()},
+            # Age of the newest footage analysed, measured from the END of
+            # that clip: how stale the freshest finished answer is.
+            "newest_done_age_seconds": (int(now - newest_done - CLIP_SECONDS)
+                                        if newest_done is not None else None),
+            "last": last,
+            "recent": list(self.recent)[-10:][::-1],
+            "processed_total": self.processed_total,
+            "errors_total": self.errors_total,
+            "last_error": self.last_error,
+        }
+        try:
+            write_heartbeat(payload, STATUS_PATH)
+        except OSError as error:
+            print(f"[⚙️ processor] status write failed: {error}", flush=True)
+
+
+def process_clip(connection, detectors: Detectors, mp4filefrominbox: Path):
+    """Analyse one inbox clip and persist everything it produced. Returns (alerted, device)."""
+    clip_id = register_clip(connection, mp4filefrominbox)
+    context = build_clip_context(connection, clip_id, mp4filefrominbox)
+
+    analysis, device = detectors.analyze(mp4filefrominbox)
+    face_engine = detectors.face_engine
+
+    plate_text = record_plate_detections(connection, analysis, context)
+    face_names = (
+        record_face_detections(connection, face_engine, analysis, context)
+        if face_engine else []
+    )
+
+    alerted = False
+    # Minimal alert rule: enough hits + snapshot exists
+    if len(analysis.hits) >= MIN_HITS_PER_CLIP and analysis.best_frame is not None:
+        alerted = True
+        alert_id = uuid.uuid4().hex[:12]
+
+        jpeg = save_jpeg(analysis.best_frame, alert_id)
+        enqueue_gif(mp4filefrominbox, alert_id)
+
+        alert = {
+            "id": alert_id,
+            "timestamp": context["ts"],
+            "source_file": mp4filefrominbox.name,
+            "camera": context["camera"],
+            "score": analysis.best_score,
+            "hits": analysis.hits,
+            "jpeg": jpeg,
+            "gif": f"{alert_id}.gif",  # generated by worker
+            "status": "gif_queued",
+            "plate": plate_text,
+            "faces": face_names,
+            "lat": context["lat"],
+            "lon": context["lon"],
+        }
+        write_alert(alert)
+
+        upsert(connection, "alerts", {
+            "id": alert_id,
+            "timestamp": context["ts"],
+            "source_file": mp4filefrominbox.name,
+            "clip_id": clip_id,
+            "camera": context["camera"],
+            "score": analysis.best_score,
+            "hit_count": len(analysis.hits),
+            "person_count": analysis.person_count,
+            "vehicle_count": analysis.vehicle_count,
+            "jpeg": jpeg,
+            "gif": f"{alert_id}.gif",
+            "status": "gif_queued",
+            "lat": context["lat"],
+            "lon": context["lon"],
+        })
+
+        extras = []
+        if plate_text:
+            extras.append(f"plate={plate_text}")
+        if face_names:
+            extras.append(f"faces={','.join(face_names)}")
+        if device == "cpu" and detectors.has_gpu:
+            extras.append("on=cpu")
+        suffix = (" " + " ".join(extras)) if extras else ""
+        print(f"[⚙️ processor] ALERT {alert_id} jpg={jpeg} score={analysis.best_score:.2f}{suffix}")
+
+    connection.execute(
+        "UPDATE clips SET status='processed', processed_ts=? WHERE id=?",
+        (now_ts(), clip_id),
+    )
+    connection.commit()
+
+    # Move processed clip out of the inbox to avoid reprocessing
+    dest = PROCESSED_DIR / mp4filefrominbox.name
+    mp4filefrominbox.rename(dest)
+    discard_source(mp4filefrominbox)
+    return alerted, device
+
+
+def run_correlation(connection) -> None:
+    try:
+        from src.correlate import run_correlation_pass
+        newly_raised = run_correlation_pass(connection)
+        for result in newly_raised:
+            print(f"[🧭 correlate] NEW {result.severity.upper()} finding: "
+                  f"{result.entity_label} ({result.score}/100)")
+            if ENABLE_NOTIFICATIONS:
+                from src.notify import notify_correlation
+                notify_correlation(connection, result)
+    except Exception as exception_object:
+        print(f"[🧭 correlate] ⧱❗️ ERROR: {exception_object}")
+
+
 def main():
     ensure_dirs()
     connection = connect()
@@ -617,6 +958,13 @@ def main():
         from src import notify
         print(f"[⚙️ processor] notifications: {notify.status_text()}")
 
+    detectors = Detectors(model, plate_reader, face_engine)
+    status = PipelineStatus(detectors)
+    print(f"[⚙️ processor] device: {detectors.device}")
+
+    uncorrelated = 0
+    last_correlation = time.monotonic()
+
     while True:
         # --- 1) Ingest step: copy stable Tesla clips into our inbox ---
         for clip in iterate_new_clips(TESLACAM_DIR):
@@ -631,83 +979,23 @@ def main():
                 register_clip(connection, inbox_clip, source_path=clip)
                 print(f"[⚙️ processor] copied -> inbox: {inbox_clip.name}")
 
-        # --- 2) Processing step: detect on inbox mp4 files ---
-        # Note: We need to look into sorting could be done during insert to save time.
-        found_work = False
-        for mp4filefrominbox in sorted(INBOX_DIR.glob("*.mp4")):
-            found_work = True
+        # --- 2) Processing step: ONE clip, the highest-priority one ---
+        # The queue is re-read after every clip so new arrivals jump ahead of
+        # any backlog; see clipqueue.py for the order.
+        entries = queue_entries(INBOX_DIR)
+        if entries:
+            entry, pending = entries[0], entries[1:]
+            mp4filefrominbox = entry["path"]
+            status.begin(entry, pending)
+            started = time.monotonic()
             try:
-                print(f"[⚙️ processor] processing: {describe_clip(mp4filefrominbox.name)}")
-
-                clip_id = register_clip(connection, mp4filefrominbox)
-                context = build_clip_context(connection, clip_id, mp4filefrominbox)
-
-                analysis = analyze_clip(model, mp4filefrominbox, plate_reader, face_engine)
-
-                plate_text = record_plate_detections(connection, analysis, context)
-                face_names = (
-                    record_face_detections(connection, face_engine, analysis, context)
-                    if face_engine else []
-                )
-
-                # Minimal alert rule: enough hits + snapshot exists
-                if len(analysis.hits) >= MIN_HITS_PER_CLIP and analysis.best_frame is not None:
-                    alert_id = uuid.uuid4().hex[:12]
-
-                    jpeg = save_jpeg(analysis.best_frame, alert_id)
-                    enqueue_gif(mp4filefrominbox, alert_id)
-
-                    alert = {
-                        "id": alert_id,
-                        "timestamp": context["ts"],
-                        "source_file": mp4filefrominbox.name,
-                        "camera": context["camera"],
-                        "score": analysis.best_score,
-                        "hits": analysis.hits,
-                        "jpeg": jpeg,
-                        "gif": f"{alert_id}.gif",  # generated by worker
-                        "status": "gif_queued",
-                        "plate": plate_text,
-                        "faces": face_names,
-                        "lat": context["lat"],
-                        "lon": context["lon"],
-                    }
-                    write_alert(alert)
-
-                    upsert(connection, "alerts", {
-                        "id": alert_id,
-                        "timestamp": context["ts"],
-                        "source_file": mp4filefrominbox.name,
-                        "clip_id": clip_id,
-                        "camera": context["camera"],
-                        "score": analysis.best_score,
-                        "hit_count": len(analysis.hits),
-                        "person_count": analysis.person_count,
-                        "vehicle_count": analysis.vehicle_count,
-                        "jpeg": jpeg,
-                        "gif": f"{alert_id}.gif",
-                        "status": "gif_queued",
-                        "lat": context["lat"],
-                        "lon": context["lon"],
-                    })
-
-                    extras = []
-                    if plate_text:
-                        extras.append(f"plate={plate_text}")
-                    if face_names:
-                        extras.append(f"faces={','.join(face_names)}")
-                    suffix = (" " + " ".join(extras)) if extras else ""
-                    print(f"[⚙️ processor] ALERT {alert_id} jpg={jpeg} score={analysis.best_score:.2f}{suffix}")
-
-                connection.execute(
-                    "UPDATE clips SET status='processed', processed_ts=? WHERE id=?",
-                    (now_ts(), clip_id),
-                )
-                connection.commit()
-
-                # Move processed clip out of the inbox to avoid reprocessing
-                dest = PROCESSED_DIR / mp4filefrominbox.name
-                mp4filefrominbox.rename(dest)
+                print(f"[⚙️ processor] processing: {describe_clip(mp4filefrominbox.name)}"
+                      f"{' [' + entry['source'] + ']' if entry['source'] else ''}"
+                      f" (queue {len(pending)})")
+                footage_seconds = clip_duration_seconds(mp4filefrominbox)
+                alerted, device = process_clip(connection, detectors, mp4filefrominbox)
+                status.finish(entry, time.monotonic() - started, footage_seconds, device,
+                              alerted, queue_entries(INBOX_DIR))
             except Exception as exception_object:
                 print(f"[⚙️ processor] ⧱❗️ ERROR {mp4filefrominbox.name}: {exception_object}")
                 # Move aside to avoid infinite loop on a bad file.
@@ -716,24 +1004,23 @@ def main():
                     mp4filefrominbox.rename(dest)
                 except Exception:
                     pass
+                discard_source(mp4filefrominbox)
+                status.fail(entry, str(exception_object), queue_entries(INBOX_DIR))
+            uncorrelated += 1
 
         # --- 3) Correlate: re-score identities, notify on new findings ---
-        # Only after we actually processed something, so an idle loop costs
-        # nothing.
-        if found_work and ENABLE_CORRELATION:
-            try:
-                from src.correlate import run_correlation_pass
-                newly_raised = run_correlation_pass(connection)
-                for result in newly_raised:
-                    print(f"[🧭 correlate] NEW {result.severity.upper()} finding: "
-                          f"{result.entity_label} ({result.score}/100)")
-                    if ENABLE_NOTIFICATIONS:
-                        from src.notify import notify_correlation
-                        notify_correlation(connection, result)
-            except Exception as exception_object:
-                print(f"[🧭 correlate] ⧱❗️ ERROR: {exception_object}")
+        # Once the queue drains, or every minute through a long backlog -
+        # not after every clip, which would re-score everything per clip.
+        if uncorrelated and ENABLE_CORRELATION and (
+            len(entries) <= 1 or time.monotonic() - last_correlation >= 60
+        ):
+            run_correlation(connection)
+            uncorrelated = 0
+            last_correlation = time.monotonic()
 
-        time.sleep(1.0)
+        if not entries:
+            status.write([])
+            time.sleep(1.0)
 
 
 if __name__ == "__main__":

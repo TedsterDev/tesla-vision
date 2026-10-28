@@ -383,7 +383,10 @@ class PlateReader:
     weights on every frame would dominate runtime.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, device: str | None = None) -> None:
+        # None lets Ultralytics choose (the GPU when there is one); the
+        # processor builds a second, "cpu" reader for its GPU fallback.
+        self.device = device
         self.yolo_plate_model = None
         self.haar_cascade = None
         self.tesseract = None
@@ -442,7 +445,8 @@ class PlateReader:
     def _run_plate_model(self, image: np.ndarray, offset_x: int = 0, offset_y: int = 0):
         """Run the plate detector on one image, returning full-frame coordinates."""
         boxes: list[tuple[tuple[int, int, int, int], float]] = []
-        for result in self.yolo_plate_model(image, verbose=False):
+        device_argument = {"device": self.device} if self.device else {}
+        for result in self.yolo_plate_model(image, verbose=False, **device_argument):
             if result.boxes is None:
                 continue
             for box in result.boxes:

@@ -61,6 +61,8 @@ from src.common import (
     env_int,
     file_is_stable,
 )
+from src.clipmeta import detect_clip_source
+from src.clipqueue import write_source
 
 INGEST_POLL_SECONDS = env_int("INGEST_POLL_SECONDS", 30)
 GADGET_CONFIGFS = Path(os.environ.get("INGEST_GADGET_CONFIGFS", "/sys/kernel/config/usb_gadget"))
@@ -104,6 +106,11 @@ def safe_copy_to_inbox(src: Path, inbox: Path = INBOX_DIR) -> Path | None:
 
     temporary = inbox / f".tmp_{src.name}"
     shutil.copy2(src, temporary)
+    # The folder it came from (SentryClips, ...) goes down BEFORE the clip
+    # appears, so the processor never sees a clip without it. The inbox is
+    # flat; without this the queue cannot put events first and the
+    # correlation engine cannot weight them. See clipqueue.py.
+    write_source(dest, detect_clip_source(src))
     temporary.rename(dest)
     return dest
 

@@ -649,6 +649,68 @@ def test_the_system_endpoint_reports_the_box_and_not_nonsense():
 
 
 # ---------------------------------------------------------------------------
+# Pipeline status
+# ---------------------------------------------------------------------------
+def test_every_page_carries_the_pipeline_row():
+    status, _, body = render("/plates")
+    assert status == 200, status
+    assert 'id="pipebar"' in body and "/api/pipeline" in body
+
+
+def test_the_recent_page_has_the_queue_card():
+    status, _, body = render("/")
+    assert status == 200, status
+    assert 'id="pipeline-card"' in body and 'id="pipeline-next"' in body
+
+
+def test_no_processor_heartbeat_reads_as_unknown_not_idle():
+    (LOGS_DIR / "processor.json").unlink(missing_ok=True)
+    status, _, body = render("/api/pipeline")
+    assert status == 200, status
+    assert json.loads(body)["state"] == "unknown", body
+
+
+def test_a_silent_idle_processor_reads_as_down():
+    (LOGS_DIR / "processor.json").write_text(json.dumps({
+        "ts": NOW - 600, "current": None, "device": "cuda", "seconds_by_camera": {},
+    }))
+    try:
+        state = json.loads(render("/api/pipeline")[2])["state"]
+        assert state == "down", state
+    finally:
+        (LOGS_DIR / "processor.json").unlink()
+
+
+def test_a_long_clip_reads_as_processing_until_it_is_stuck():
+    from src.common import INBOX_DIR
+    for name in ("2026-02-16_21-31-48-front.mp4", "2026-02-16_21-31-48-back.mp4"):
+        (INBOX_DIR / name).write_bytes(b"")
+    current = {"name": "2026-02-16_21-31-48-front.mp4", "camera": "front",
+               "captured_ts": NOW - 3600}
+    try:
+        # A clip 40 s in with no heartbeat since it began is normal.
+        (LOGS_DIR / "processor.json").write_text(json.dumps({
+            "ts": NOW - 40, "current": dict(current, started_ts=NOW - 40),
+            "seconds_by_camera": {"back": 5.0, "front": 12.0},
+        }))
+        result = json.loads(render("/api/pipeline")[2])
+        assert result["state"] == "processing", result
+        # The clip being processed is not also counted as waiting.
+        assert result["queue"]["depth"] == 1, result["queue"]
+        assert result["eta_seconds"] == 5.0, result["eta_seconds"]
+
+        (LOGS_DIR / "processor.json").write_text(json.dumps({
+            "ts": NOW - 1000, "current": dict(current, started_ts=NOW - 1000),
+            "seconds_by_camera": {},
+        }))
+        assert json.loads(render("/api/pipeline")[2])["state"] == "stuck"
+    finally:
+        (LOGS_DIR / "processor.json").unlink(missing_ok=True)
+        for clip in INBOX_DIR.glob("*.mp4"):
+            clip.unlink()
+
+
+# ---------------------------------------------------------------------------
 def main() -> int:
     tests = [
         value for name, value in sorted(globals().items())
