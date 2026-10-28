@@ -70,6 +70,32 @@ services:
       - BASE_DIR=/data
     restart: unless-stopped
 
+  # Self-hosted push notifications. The processor posts findings here and the
+  # ntfy phone app subscribes over Tailscale (http://100.98.227.42:8090), so
+  # alert text - plates, cameras, times - never passes through a public
+  # server. Access is deny-all by default: the processor publishes with a
+  # write-only token and the phone reads with a read-only account
+  # (scripts/setup_ntfy.sh creates both). Published on every interface
+  # because Docker cannot bind the tailnet address before tailscaled is up;
+  # without credentials the port answers nothing useful.
+  ntfy:
+    image: binwiederhier/ntfy:v2.11.0
+    command: ["serve"]
+    ports:
+      - "8090:80"
+    volumes:
+      - /mnt/jetsondata/tesla-alerts/ntfy:/var/lib/ntfy
+    environment:
+      - NTFY_BASE_URL=http://100.98.227.42:8090
+      - NTFY_LISTEN_HTTP=:80
+      - NTFY_CACHE_FILE=/var/lib/ntfy/cache.db
+      - NTFY_CACHE_DURATION=72h
+      - NTFY_AUTH_FILE=/var/lib/ntfy/auth.db
+      - NTFY_AUTH_DEFAULT_ACCESS=deny-all
+      - NTFY_ENABLE_LOGIN=true
+      - TZ=America/Los_Angeles
+    restart: unless-stopped
+
   web:
     build:
       context: .
