@@ -565,6 +565,68 @@ def test_the_crash_loop_banner_needs_more_than_one_restart_and_can_clear():
 
 
 # ---------------------------------------------------------------------------
+# Served under a path prefix (azula.tedebyte.dev/tesla/)
+# ---------------------------------------------------------------------------
+def with_url_root(root):
+    saved = ui_app.URL_ROOT
+    ui_app.URL_ROOT = root
+    return saved
+
+
+def test_prefixed_and_bare_paths_reach_the_same_route():
+    saved = with_url_root("/tesla")
+    try:
+        for path in ("/tesla/healthz", "/healthz", "/tesla/settings", "/settings"):
+            status, _, _ = render(path)
+            assert status == 200, (path, status)
+    finally:
+        ui_app.URL_ROOT = saved
+
+
+def test_the_bare_prefix_redirects_to_its_trailing_slash():
+    saved = with_url_root("/tesla")
+    try:
+        status, headers, _ = render("/tesla")
+        assert status == 308, status
+        assert headers.get("location") == "/tesla/", headers
+        # A segment boundary, not a string prefix: /teslafoo is not ours.
+        status, _, _ = render("/teslafoo")
+        assert status == 404, status
+    finally:
+        ui_app.URL_ROOT = saved
+
+
+def test_the_location_gate_still_sees_a_prefixed_location_route():
+    # The prefix is stripped OUTSIDE the auth middleware. Were it the other way
+    # round, /tesla/findmy would not match LOCATION_ROUTES and would serve.
+    saved_root = with_url_root("/tesla")
+    saved_auth = with_auth_settings("", True, None)
+    try:
+        for path in ("/tesla/gps", "/tesla/findmy", "/tesla/api/gps", "/tesla/api/findmy"):
+            status, _, _ = render(path)
+            assert status == 503, (path, status)
+    finally:
+        restore_auth_settings(saved_auth)
+        ui_app.URL_ROOT = saved_root
+
+
+def test_every_page_link_carries_the_prefix():
+    import re
+    saved = with_url_root("/tesla")
+    try:
+        for path in ("/", "/findings", "/plates", "/faces", "/timeline", "/natix", "/settings"):
+            status, _, body = render("/tesla" + path)
+            assert status == 200, (path, status)
+            assert 'var URL_ROOT = "/tesla";' in body, path
+            # Any root-relative href/src that skipped the prefix. "//" is a
+            # scheme-relative URL to another host, which is not ours to fix.
+            stray = re.findall(r'(?:href|src)="(/(?!/)(?!tesla(?:/|"))[^"]*)"', body)
+            assert not stray, (path, stray[:5])
+    finally:
+        ui_app.URL_ROOT = saved
+
+
+# ---------------------------------------------------------------------------
 def main() -> int:
     tests = [
         value for name, value in sorted(globals().items())

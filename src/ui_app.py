@@ -53,6 +53,7 @@ from fastapi import Response
 
 from src import cfaccess
 from fastapi.responses import PlainTextResponse
+from fastapi.responses import RedirectResponse
 
 from src.common import (
     MEDIA_DIR,
@@ -117,6 +118,15 @@ app = FastAPI(title="Tesla Vision - Surveillance Detection", lifespan=tesla_dash
 DASHBOARD_USER = os.environ.get("DASHBOARD_USER", "").strip()
 DASHBOARD_PASS = os.environ.get("DASHBOARD_PASS", "").strip()
 AUTH_ENABLED = bool(DASHBOARD_PASS)
+
+# --- Path prefix -------------------------------------------------------------
+# azula.tedebyte.dev is shared: '/' and most of /api/* belong to the spv-server,
+# so the tunnel hands this dashboard everything under /tesla instead. Every
+# link a page emits starts with URL_ROOT, and _StripUrlRoot below removes it
+# again before routing, so the routes themselves never mention it. Unprefixed
+# paths keep working too, which is what the LAN and tailnet use at :8080.
+# Empty (the default) means the dashboard owns its whole host.
+URL_ROOT = os.environ.get("URL_ROOT", "").strip().rstrip("/")
 
 def _constant_time_equal(time_a: str, time_b: str) -> bool:
     return hmac.compare_digest(time_a.encode("utf-8"), time_b.encode("utf-8"))
@@ -351,6 +361,38 @@ async def require_basic_auth(request: Request, call_next):
     return await call_next(request)
 
 
+class _StripUrlRoot:
+    """
+    Pure ASGI, not @app.middleware: it must run OUTSIDE require_basic_auth so
+    the auth gate, and LOCATION_ROUTES in particular, see /findmy and not
+    /tesla/findmy. Starlette wraps later-added middleware around earlier, so
+    adding this after the auth middleware makes it the outer layer.
+    """
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def __call__(self, scope, receive, send):
+        if URL_ROOT and scope["type"] in ("http", "websocket"):
+            path = scope["path"]
+            if path == URL_ROOT:
+                # /tesla -> /tesla/, or every relative fetch on the page
+                # would resolve one level too high.
+                query = scope.get("query_string", b"").decode("latin-1")
+                location = URL_ROOT + "/" + (f"?{query}" if query else "")
+                await RedirectResponse(location, status_code=308)(scope, receive, send)
+                return
+            if path.startswith(URL_ROOT + "/"):
+                scope = dict(scope, path=path[len(URL_ROOT):])
+                raw_path = scope.get("raw_path")
+                if raw_path and raw_path.startswith(URL_ROOT.encode() + b"/"):
+                    scope["raw_path"] = raw_path[len(URL_ROOT):]
+        await self.inner(scope, receive, send)
+
+
+app.add_middleware(_StripUrlRoot)
+
+
 # Serve files in /data/media at /media/<filename>
 app.mount("/media", StaticFiles(directory=str(MEDIA_DIR)), name="media")
 
@@ -442,9 +484,12 @@ NAV_TABS = [
 def render_page(title: str, body: str, active_path: str = "", head_extra: str = "") -> HTMLResponse:
     """Wrap page content in the shared shell (nav, styles, viewport)."""
     tabs = "".join(
-        f'<a class="tab{" active" if path == active_path else ""}" href="{path}">{esc(label)}</a>'
+        f'<a class="tab{" active" if path == active_path else ""}" href="{URL_ROOT}{path}">{esc(label)}</a>'
         for path, label in NAV_TABS
     )
+    # Page scripts that live in plain (non-f) strings build their URLs from
+    # this, so it has to be defined before head_extra or the body run.
+    url_root_js = json.dumps(URL_ROOT).replace("<", "\\u003c")
 
     return HTMLResponse(f"""<!doctype html>
 <html><head>
@@ -452,6 +497,7 @@ def render_page(title: str, body: str, active_path: str = "", head_extra: str = 
   <title>{esc(title)} - Tesla Vision</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>{PAGE_STYLES}</style>
+  <script>var URL_ROOT = {url_root_js};</script>
   {head_extra}
 </head>
 <body>
@@ -829,7 +875,7 @@ def index(limit: int = 25):
     if top_findings:
         items = "".join(
             f'<div style="padding:6px 0;">{severity_pill(row["severity"])} '
-            f'<a href="/entity/{esc(row["entity_type"])}/{esc(row["entity_id"])}">'
+            f'<a href="{URL_ROOT}/entity/{esc(row["entity_type"])}/{esc(row["entity_id"])}">'
             f'<b>{esc(row["entity_label"])}</b></a> '
             f'<span class="muted">scored {esc(row["score"])}/100</span></div>'
             for row in top_findings
@@ -838,7 +884,7 @@ def index(limit: int = 25):
             '<div class="card" style="border-color:var(--high);">'
             '<div style="font-weight:800; margin-bottom:6px;">⚠️ Active surveillance findings</div>'
             f'{items}'
-            '<div style="margin-top:8px;"><a href="/findings">See all findings →</a></div>'
+            f'<div style="margin-top:8px;"><a href="{URL_ROOT}/findings">See all findings →</a></div>'
             '</div>'
         )
 
@@ -852,7 +898,7 @@ def index(limit: int = 25):
 
     more_link = (
         f'<div style="text-align:center; padding:16px;">'
-        f'<a class="btn" href="/?limit={limit + 50}">Show more '
+        f'<a class="btn" href="{URL_ROOT}/?limit={limit + 50}">Show more '
         f'({limit} of {total_alerts})</a></div>'
         if total_alerts > limit else ""
     )
@@ -864,8 +910,8 @@ def index(limit: int = 25):
         # loading="lazy" matters more than it looks: GIF previews are megabytes
         # each and this view lists many alerts, so eager loading would pull the
         # whole media directory on one page load over a phone hotspot.
-        jpeg_tag = f'<img class="evidence" loading="lazy" src="/media/{esc(jpeg)}" style="max-width:420px;" />' if jpeg else ""
-        gif_tag = f'<img class="evidence" loading="lazy" src="/media/{esc(gif)}" style="max-width:420px;" />' if gif else ""
+        jpeg_tag = f'<img class="evidence" loading="lazy" src="{URL_ROOT}/media/{esc(jpeg)}" style="max-width:420px;" />' if jpeg else ""
+        gif_tag = f'<img class="evidence" loading="lazy" src="{URL_ROOT}/media/{esc(gif)}" style="max-width:420px;" />' if gif else ""
 
         extra = ""
         if alert.get("plate"):
@@ -927,7 +973,7 @@ def findings_view():
               <div>
                 {severity_pill(finding["severity"])}
                 <span style="font-size:18px; font-weight:800; margin-left:8px;">
-                  <a href="/entity/{esc(finding["entity_type"])}/{esc(finding["entity_id"])}">{esc(finding["entity_label"])}</a>
+                  <a href="{URL_ROOT}/entity/{esc(finding["entity_type"])}/{esc(finding["entity_id"])}">{esc(finding["entity_label"])}</a>
                 </span>
                 <span class="muted"> · {esc(entity_kind)}</span>
               </div>
@@ -974,14 +1020,14 @@ def plates_view():
     cards = []
     for plate in plates:
         image = (
-            f'<img class="evidence" loading="lazy" src="/media/{esc(plate["best_image"])}" style="max-height:96px;" />'
+            f'<img class="evidence" loading="lazy" src="{URL_ROOT}/media/{esc(plate["best_image"])}" style="max-height:96px;" />'
             if plate.get("best_image") else '<div class="muted">no crop saved</div>'
         )
         known_badge = '<span class="pill low">known</span>' if plate["is_known"] else ""
         cards.append(f"""
           <div class="card">
             <div style="margin-bottom:10px;">
-              <a href="/entity/plate/{esc(plate["id"])}"><span class="plate">{esc(plate["plate_text"])}</span></a>
+              <a href="{URL_ROOT}/entity/plate/{esc(plate["id"])}"><span class="plate">{esc(plate["plate_text"])}</span></a>
               {known_badge}
             </div>
             {image}
@@ -1011,7 +1057,7 @@ def faces_view():
     cards = []
     for face in faces:
         image = (
-            f'<img class="evidence" loading="lazy" src="/media/{esc(face["best_image"])}" style="max-height:150px;" />'
+            f'<img class="evidence" loading="lazy" src="{URL_ROOT}/media/{esc(face["best_image"])}" style="max-height:150px;" />'
             if face.get("best_image") else '<div class="muted">no crop saved</div>'
         )
         known_badge = '<span class="pill low">known</span>' if face["is_known"] else ""
@@ -1019,7 +1065,7 @@ def faces_view():
         cards.append(f"""
           <div class="card">
             <div style="font-weight:700; font-size:16px; margin-bottom:8px;">
-              <a href="/entity/face/{esc(face["id"])}">{esc(display_name)}</a> {known_badge}
+              <a href="{URL_ROOT}/entity/face/{esc(face["id"])}">{esc(display_name)}</a> {known_badge}
             </div>
             {image}
             <div class="muted" style="margin-top:10px;">
@@ -1111,7 +1157,7 @@ def entity_view(entity_type: str, entity_id: str):
           <td>{esc(row["camera"] or "-")}</td>
           <td class="mono" style="font-size:12px;">{esc(row["source_file"] or "-")}</td>
           <td>{esc(f'{row["lat"]:.5f}, {row["lon"]:.5f}' if row["lat"] is not None else "no GPS")}</td>
-          <td>{'<img class="evidence" loading="lazy" src="/media/' + esc(row["image"]) + '" style="max-height:52px;" />' if row["image"] else ""}</td>
+          <td>{'<img class="evidence" loading="lazy" src="' + URL_ROOT + '/media/' + esc(row["image"]) + '" style="max-height:52px;" />' if row["image"] else ""}</td>
           {split_cell(row)}
         </tr>
     """ for row in detections)
@@ -1202,7 +1248,7 @@ def entity_view(entity_type: str, entity_id: str):
         let isKnown = {"true" if entity["is_known"] else "false"};
 
         async function post(payload) {{
-          const response = await fetch(`/api/${{ENTITY_TABLE}}/${{ENTITY_ID}}/label`, {{
+          const response = await fetch(`{URL_ROOT}/api/${{ENTITY_TABLE}}/${{ENTITY_ID}}/label`, {{
             method: "POST",
             headers: {{ "Content-Type": "application/json" }},
             body: JSON.stringify(payload),
@@ -1218,21 +1264,21 @@ def entity_view(entity_type: str, entity_id: str):
         }}
         async function mergeInto() {{
           const target = document.getElementById("mergeTarget").value;
-          const response = await fetch(`/api/faces/${{ENTITY_ID}}/merge`, {{
+          const response = await fetch(`{URL_ROOT}/api/faces/${{ENTITY_ID}}/merge`, {{
             method: "POST",
             headers: {{ "Content-Type": "application/json" }},
             body: JSON.stringify({{ into: target }}),
           }});
           const result = await response.json();
-          if (result.ok) location.href = `/entity/face/${{target}}`;
+          if (result.ok) location.href = `{URL_ROOT}/entity/face/${{target}}`;
           else alert("Merge failed: " + (result.error || "unknown error"));
         }}
         async function splitDetection(detectionId) {{
-          const response = await fetch(`/api/faces/detections/${{detectionId}}/split`, {{
+          const response = await fetch(`{URL_ROOT}/api/faces/detections/${{detectionId}}/split`, {{
             method: "POST",
           }});
           const result = await response.json();
-          if (result.ok) location.href = `/entity/face/${{result.new_face_id}}`;
+          if (result.ok) location.href = `{URL_ROOT}/entity/face/${{result.new_face_id}}`;
           else alert("Split failed: " + (result.error || "unknown error"));
         }}
       </script>
@@ -1266,7 +1312,7 @@ def timeline_view():
           const summary = document.getElementById("summary");
           let data;
           try {
-            data = await (await fetch("/api/map")).json();
+            data = await (await fetch(URL_ROOT + "/api/map")).json();
           } catch (error) {
             summary.innerHTML = '<span class="muted">Could not load map data.</span>';
             return;
@@ -1274,7 +1320,7 @@ def timeline_view():
 
           if (typeof L === "undefined") {
             summary.innerHTML = '<span class="muted">Leaflet could not load (no internet). ' +
-              'Map data is still available at <a href="/api/map">/api/map</a>.</span>';
+              'Map data is still available at <a href="' + URL_ROOT + '/api/map">/api/map</a>.</span>';
             return;
           }
 
@@ -1322,14 +1368,14 @@ def timeline_view():
               const history = document.createElement("a");
               // encodeURIComponent, so an id carrying a slash or a quote
               // cannot climb out of the path it is supposed to be part of.
-              history.href = "/entity/" + encodeURIComponent(kind) + "/" +
+              history.href = URL_ROOT + "/entity/" + encodeURIComponent(kind) + "/" +
                 encodeURIComponent(point.entity_id == null ? "" : point.entity_id);
               history.textContent = "history";
               popup.appendChild(history);
               if (point.image) {
                 popup.appendChild(document.createElement("br"));
                 const evidence = document.createElement("img");
-                evidence.src = "/media/" + encodeURIComponent(point.image);
+                evidence.src = URL_ROOT + "/media/" + encodeURIComponent(point.image);
                 evidence.style.maxWidth = "180px";
                 evidence.style.borderRadius = "6px";
                 evidence.style.marginTop = "6px";
@@ -1608,8 +1654,8 @@ def natix_view():
   async function refresh() {
     try {
       const [statusRes, logRes] = await Promise.all([
-        fetch('/api/natix', {cache: 'no-store'}),
-        fetch('/api/natix/logs?lines=400', {cache: 'no-store'})
+        fetch(URL_ROOT + '/api/natix', {cache: 'no-store'}),
+        fetch(URL_ROOT + '/api/natix/logs?lines=400', {cache: 'no-store'})
       ]);
       const status = await statusRes.json();
       const logs = await logRes.json();
@@ -3455,8 +3501,8 @@ def gps_view():
     // growing pile of sockets.
     var abortTimer = setTimeout(function () { controller.abort(); }, intervalMs() * 2);
     Promise.all([
-      fetch("/api/gps", {cache: "no-store", signal: controller.signal}),
-      fetch("/api/gps/logs?lines=400", {cache: "no-store", signal: controller.signal})
+      fetch(URL_ROOT + "/api/gps", {cache: "no-store", signal: controller.signal}),
+      fetch(URL_ROOT + "/api/gps/logs?lines=400", {cache: "no-store", signal: controller.signal})
     ]).then(function (responses) {
       // ok is checked BEFORE .json(). A 401 after a Cloudflare Access session
       // expires returns HTML, and letting .json() throw the parse error would
@@ -3565,8 +3611,8 @@ def _findmy_map_head() -> str:
     vendored_style = MEDIA_DIR / "leaflet" / "leaflet.css"
     if vendored_script.exists() and vendored_style.exists():
         source = "vendored under /media/leaflet"
-        style_href = "/media/leaflet/leaflet.css"
-        script_src = "/media/leaflet/leaflet.js"
+        style_href = f"{URL_ROOT}/media/leaflet/leaflet.css"
+        script_src = f"{URL_ROOT}/media/leaflet/leaflet.js"
     else:
         source = "the unpkg CDN"
         style_href = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
@@ -3713,7 +3759,7 @@ def findmy_view():
             <span id="findmy-newest-poll">{esc(_format_clock(state.get('newest_poll_ts')) or 'never')}</span> ·
             newest dashcam clip
             <span id="findmy-newest-clip">{esc(_format_clock(state.get('newest_clip_ts')) or 'never')}</span>.
-            <a href="/gps">Receiver detail →</a>
+            <a href="{URL_ROOT}/gps">Receiver detail →</a>
           </div>
           <div class="muted" style="margin-top:6px;" id="findmy-status">
             served {esc(format_timestamp(state.get('server_ts')))}
@@ -4050,7 +4096,7 @@ def findmy_view():
     inFlight = true;
     var controller = new AbortController();
     var abortTimer = setTimeout(function () { controller.abort(); }, intervalMs() * 2);
-    fetch("/api/findmy", {cache: "no-store", signal: controller.signal})
+    fetch(URL_ROOT + "/api/findmy", {cache: "no-store", signal: controller.signal})
       .then(function (response) {
         if (!response.ok) { throw new Error("HTTP " + response.status); }
         return response.json();
@@ -4236,13 +4282,13 @@ def settings_view():
       <div class="card">
         <div style="font-weight:700; margin-bottom:10px;">API</div>
         <div class="muted">
-          <a href="/api/findings">/api/findings</a> ·
-          <a href="/api/plates">/api/plates</a> ·
-          <a href="/api/faces">/api/faces</a> ·
-          <a href="/api/polls">/api/polls</a> ·
-          <a href="/api/drives">/api/drives</a> ·
-          <a href="/api/map">/api/map</a> ·
-          <a href="/alerts">/alerts</a>
+          <a href="{URL_ROOT}/api/findings">/api/findings</a> ·
+          <a href="{URL_ROOT}/api/plates">/api/plates</a> ·
+          <a href="{URL_ROOT}/api/faces">/api/faces</a> ·
+          <a href="{URL_ROOT}/api/polls">/api/polls</a> ·
+          <a href="{URL_ROOT}/api/drives">/api/drives</a> ·
+          <a href="{URL_ROOT}/api/map">/api/map</a> ·
+          <a href="{URL_ROOT}/alerts">/alerts</a>
         </div>
       </div>
     """

@@ -83,4 +83,8 @@ services:
       # Without this it writes its config into the container's ephemeral HOME
       # instead of sharing the processor's, and loses it on every recreate.
       - YOLO_CONFIG_DIR=/data/.config
+      # The tunnel publishes this dashboard at azula.tedebyte.dev/tesla/ (that
+      # hostname's '/' belongs to the spv-server). Links carry the prefix; the
+      # app strips it, so http://<jetson>:8080/ without it still works.
+      - URL_ROOT=/tesla
     restart: unless-stopped
