@@ -490,7 +490,14 @@ PAGE_STYLES = """
   .reason::before { content:"▸ "; color:var(--accent); }
   .reason.alarm { color:var(--high); font-weight:700; }
   .reason.alarm::before { content:"⚠ "; }
-  footer.sysbar { border-top:1px solid var(--line); margin-top:28px; padding:12px 20px 18px;
+  /* Pinned to the bottom of every page. --footer-h is measured by the
+     script below (the footer wraps differently at every width) so the page
+     can pad itself and nothing ends up hidden behind it. */
+  :root { --footer-h: 64px; }
+  body { padding-bottom:calc(var(--footer-h) + 12px); }
+  footer.sysbar { position:fixed; left:0; right:0; bottom:0; z-index:20;
+                  background:rgba(11,11,15,0.94); backdrop-filter:blur(8px);
+                  border-top:1px solid var(--line); padding:8px 20px calc(8px + env(safe-area-inset-bottom));
                   color:var(--muted); font-size:12px; }
   footer.sysbar .inner { max-width:1400px; margin:0 auto; display:flex; flex-wrap:wrap;
                          gap:6px 18px; align-items:center; }
@@ -500,7 +507,15 @@ PAGE_STYLES = """
   footer.sysbar .metric.warn b { color:var(--medium); }
   footer.sysbar .metric.high b { color:var(--high); }
   footer.sysbar .metric.good b { color:var(--low); }
-  footer.sysbar .inner + .inner { margin-top:6px; }
+  footer.sysbar .inner + .inner { margin-top:4px; }
+  @media (max-width: 700px) {
+    /* One scrollable line per row on a phone, not a wall of wrapped metrics.
+       After the base .inner rules, which would otherwise win. */
+    footer.sysbar { padding-left:12px; padding-right:12px; }
+    footer.sysbar .inner { flex-wrap:nowrap; overflow-x:auto; white-space:nowrap;
+                           scrollbar-width:none; -webkit-overflow-scrolling:touch; }
+    footer.sysbar .inner::-webkit-scrollbar { display:none; }
+  }
   .pipeline-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:14px; }
   .pipe-head { display:flex; justify-content:space-between; align-items:center; gap:10px;
                flex-wrap:wrap; margin-bottom:12px; }
@@ -626,7 +641,7 @@ ACTIVITY_STYLES = """
   #tv-bar.err div { background:var(--high); animation:none; width:100%; }
   @keyframes tvslide { from { left:-40%; } to { left:100%; } }
 
-  #tv-pill { position:fixed; right:14px; bottom:14px; z-index:998; max-width:min(420px, calc(100vw - 28px));
+  #tv-pill { position:fixed; right:14px; bottom:calc(var(--footer-h, 0px) + 10px); z-index:998; max-width:min(420px, calc(100vw - 28px));
              background:var(--panel); border:1px solid var(--line); border-radius:999px;
              padding:7px 14px; font-size:12px; display:flex; gap:8px; align-items:center;
              box-shadow:0 8px 24px rgba(0,0,0,.4); cursor:pointer; transition:opacity .2s, transform .2s; }
@@ -1268,6 +1283,12 @@ SYSBAR_SCRIPT = """
 (function () {
   const bar = document.getElementById("sysbar");
   if (!bar) return;
+  const footer = bar.closest("footer");
+  const setFooterHeight = () =>
+    document.documentElement.style.setProperty("--footer-h", footer.offsetHeight + "px");
+  setFooterHeight();
+  if (window.ResizeObserver) new ResizeObserver(setFooterHeight).observe(footer);
+  else window.addEventListener("resize", setFooterHeight);
   const gib = (bytes) => (bytes / 1073741824).toFixed(1);
   const level = (percent, warn, high) => percent >= high ? "high" : percent >= warn ? "warn" : "";
   function put(key, text, cls) {
