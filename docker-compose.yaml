@@ -4,8 +4,16 @@ services:
       context: .
       dockerfile: docker/Dockerfile
     command: ["python", "-u", "src/processor.py"]
+    # The Orin's GPU: YOLO runs ~35 ms a frame here against ~2 s on the CPU.
+    # The runtime passes in the GPU devices and driver; JetPack 6 leaves the
+    # CUDA and cuDNN userspace to the container, so the host's are mounted
+    # read-only and docker/jetson-env.sh puts them on the library path. Using
+    # the host's keeps them matched to the driver across JetPack updates.
+    runtime: nvidia
     volumes:
       - /mnt/jetsondata/tesla-alerts:/data
+      - /usr/local/cuda-12.6:/usr/local/cuda:ro
+      - /usr/lib/aarch64-linux-gnu:/host-lib:ro
     env_file: .env
     environment:
       - PYTHONPATH=/app
@@ -69,8 +77,14 @@ services:
     command: ["uvicorn", "src.ui_app:app", "--host", "0.0.0.0", "--port", "8080"]
     ports:
       - "8080:8080"
+    # The CUDA libraries but NOT the nvidia runtime: the Settings page imports
+    # torch (via PlateReader), and the JetPack wheel will not load without
+    # them, but this process should stay on the CPU rather than take a CUDA
+    # context's worth of the RAM it shares with the processor.
     volumes:
       - /mnt/jetsondata/tesla-alerts:/data
+      - /usr/local/cuda-12.6:/usr/local/cuda:ro
+      - /usr/lib/aarch64-linux-gnu:/host-lib:ro
     env_file: .env
     environment:
       - BASE_DIR=/data

@@ -1,0 +1,7 @@
+# Applied to every pip install in docker/Dockerfile (PIP_CONSTRAINT).
+# The JetPack 6 PyTorch wheels - see the comment above their install.
+torch==2.8.0
+torchvision==0.23.0
+# Those wheels are built against the NumPy 1.x ABI; with NumPy 2 torch loads
+# but every tensor <-> array conversion fails with "Numpy is not available".
+numpy<2
