@@ -11,6 +11,7 @@ are about refusal and recovery rather than about the happy path.
 
 Run:  python3 tests/test_natix.py       (or: python3 -m pytest tests/ -v)
 """
+import contextlib
 import json
 import os
 import shutil
@@ -144,6 +145,26 @@ class Sandbox:
         natix.INBOX_DIR = self._saved_inbox
         self.connection.close()
         shutil.rmtree(self.root, ignore_errors=True)
+
+
+@contextlib.contextmanager
+def fixed_capacity(capacity: int = 10_000_000):
+    """
+    Pin natix.free_bytes to a fake volume: `capacity` minus what is on it.
+
+    Tests that ask for "one event more than is free right now" cannot read the
+    real filesystem. The temp dir shares a disk with everything else running on
+    the machine, so free space moves between the test's reading and the code's,
+    and a margin of one small clip is gone before the code looks.
+    """
+    saved_free = natix.free_bytes
+    natix.free_bytes = lambda root: max(
+        0, capacity - sum(p.stat().st_size for p in Path(root).rglob("*") if p.is_file())
+    )
+    try:
+        yield
+    finally:
+        natix.free_bytes = saved_free
 
 
 # ---------------------------------------------------------------------------
@@ -496,9 +517,10 @@ def test_reclaim_takes_the_oldest_recording_first_across_buckets():
     with Sandbox() as box:
         oldest = make_foreign_event(box.stick, "RecentClips", "2026-01-01_08-00-00")
         newest = make_foreign_event(box.stick, "SentryClips", "2026-09-01_08-00-00")
-        plan = natix.plan_reclaim(box.connection, "uuid:TEST", box.stick,
-                                  need_bytes=natix.free_bytes(box.stick) + 1,
-                                  buckets=["SentryClips", "RecentClips"])
+        with fixed_capacity():
+            plan = natix.plan_reclaim(box.connection, "uuid:TEST", box.stick,
+                                      need_bytes=natix.free_bytes(box.stick) + 1,
+                                      buckets=["SentryClips", "RecentClips"])
         assert len(plan) == 1
         assert plan[0][1] == oldest, f"chose {plan[0][1]} before {oldest}"
         assert newest.exists()
@@ -511,9 +533,10 @@ def test_reclaim_stops_once_there_is_enough_room():
                   for stamp in ("2026-01-01_08-00-00", "2026-02-01_08-00-00",
                                 "2026-03-01_08-00-00")]
         one_event = natix._entry_size(events[0])
-        plan = natix.plan_reclaim(box.connection, "uuid:TEST", box.stick,
-                                  need_bytes=natix.free_bytes(box.stick) + one_event,
-                                  buckets=["SentryClips"])
+        with fixed_capacity():
+            plan = natix.plan_reclaim(box.connection, "uuid:TEST", box.stick,
+                                      need_bytes=natix.free_bytes(box.stick) + one_event,
+                                      buckets=["SentryClips"])
         assert len(plan) == 1, f"planned to delete {len(plan)} events to free one"
 
 
@@ -859,8 +882,9 @@ def test_prune_orders_by_event_age_not_by_bucket():
 
         # Free just enough for one event: the older SentryClips one must go.
         one_clip = (box.archive / "2026-02-10_08-00-00-front.mp4").stat().st_size
-        natix.prune_oldest(box.connection, "uuid:TEST", box.stick,
-                           need_bytes=natix.free_bytes(box.stick) + one_clip)
+        with fixed_capacity():
+            natix.prune_oldest(box.connection, "uuid:TEST", box.stick,
+                               need_bytes=natix.free_bytes(box.stick) + one_clip)
 
         assert not sentry.exists(), "the older event should have been pruned"
         assert saved.exists(), "pruned a newer SavedClips event before an older one"

@@ -53,8 +53,11 @@ from fastapi import Response
 
 from src import cfaccess
 from fastapi.responses import PlainTextResponse
+from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse
 
 from src.common import (
+    BASE_DIR,
     MEDIA_DIR,
     ALERTS_DIR,
     ensure_dirs
@@ -89,6 +92,10 @@ async def tesla_dashboard_app_lifespan(app: FastAPI):
     else:
         print("[🔐 ui] Basic Auth DISABLED (set DASHBOARD_PASS to enable)")
 
+    # Off the event loop: it loads a YOLO model, and startup must not wait.
+    import threading
+    threading.Thread(target=_warm_stage_status, name="warm-settings", daemon=True).start()
+
     # Pull any alert JSON written before the database existed into the alerts
     # table, so upgrading doesn't appear to lose history.
     #
@@ -117,6 +124,15 @@ app = FastAPI(title="Tesla Vision - Surveillance Detection", lifespan=tesla_dash
 DASHBOARD_USER = os.environ.get("DASHBOARD_USER", "").strip()
 DASHBOARD_PASS = os.environ.get("DASHBOARD_PASS", "").strip()
 AUTH_ENABLED = bool(DASHBOARD_PASS)
+
+# --- Path prefix -------------------------------------------------------------
+# azula.tedebyte.dev is shared: '/' and most of /api/* belong to the spv-server,
+# so the tunnel hands this dashboard everything under /tesla instead. Every
+# link a page emits starts with URL_ROOT, and _StripUrlRoot below removes it
+# again before routing, so the routes themselves never mention it. Unprefixed
+# paths keep working too, which is what the LAN and tailnet use at :8080.
+# Empty (the default) means the dashboard owns its whole host.
+URL_ROOT = os.environ.get("URL_ROOT", "").strip().rstrip("/")
 
 def _constant_time_equal(time_a: str, time_b: str) -> bool:
     return hmac.compare_digest(time_a.encode("utf-8"), time_b.encode("utf-8"))
@@ -351,6 +367,56 @@ async def require_basic_auth(request: Request, call_next):
     return await call_next(request)
 
 
+class _StripUrlRoot:
+    """
+    Pure ASGI, not @app.middleware: it must run OUTSIDE require_basic_auth so
+    the auth gate, and LOCATION_ROUTES in particular, see /findmy and not
+    /tesla/findmy. Starlette wraps later-added middleware around earlier, so
+    adding this after the auth middleware makes it the outer layer.
+    """
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def __call__(self, scope, receive, send):
+        if URL_ROOT and scope["type"] in ("http", "websocket"):
+            path = scope["path"]
+            if path == URL_ROOT:
+                # /tesla -> /tesla/, or every relative fetch on the page
+                # would resolve one level too high.
+                query = scope.get("query_string", b"").decode("latin-1")
+                location = URL_ROOT + "/" + (f"?{query}" if query else "")
+                await RedirectResponse(location, status_code=308)(scope, receive, send)
+                return
+            if path.startswith(URL_ROOT + "/"):
+                scope = dict(scope, path=path[len(URL_ROOT):])
+                raw_path = scope.get("raw_path")
+                if raw_path and raw_path.startswith(URL_ROOT.encode() + b"/"):
+                    scope["raw_path"] = raw_path[len(URL_ROOT):]
+        if scope["type"] != "http":
+            await self.inner(scope, receive, send)
+            return
+
+        # Server-Timing: how long the Orin spent before the first byte. The
+        # loading screen reads it from the browser's navigation and resource
+        # timing, which is how it can say "the Orin built this page in 9 ms"
+        # separately from the network time around it.
+        started = time.perf_counter()
+
+        async def timed_send(message):
+            if message["type"] == "http.response.start":
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                headers = list(message.get("headers", []))
+                headers.append((b"server-timing", f"app;dur={elapsed_ms:.1f};desc=\"Orin\"".encode()))
+                message = dict(message, headers=headers)
+            await send(message)
+
+        await self.inner(scope, receive, timed_send)
+
+
+app.add_middleware(_StripUrlRoot)
+
+
 # Serve files in /data/media at /media/<filename>
 app.mount("/media", StaticFiles(directory=str(MEDIA_DIR)), name="media")
 
@@ -424,6 +490,86 @@ PAGE_STYLES = """
   .reason::before { content:"▸ "; color:var(--accent); }
   .reason.alarm { color:var(--high); font-weight:700; }
   .reason.alarm::before { content:"⚠ "; }
+  /* Pinned to the bottom of every page. --footer-h is measured by the
+     script below (the footer wraps differently at every width) so the page
+     can pad itself and nothing ends up hidden behind it. */
+  :root { --footer-h: 64px; }
+  body { padding-bottom:calc(var(--footer-h) + 12px); }
+  footer.sysbar { position:fixed; left:0; right:0; bottom:0; z-index:20;
+                  background:rgba(11,11,15,0.94); backdrop-filter:blur(8px);
+                  border-top:1px solid var(--line); padding:8px 20px calc(8px + env(safe-area-inset-bottom));
+                  color:var(--muted); font-size:12px; }
+  footer.sysbar .inner { max-width:1400px; margin:0 auto; display:flex; flex-wrap:wrap;
+                         gap:6px 18px; align-items:center; }
+  footer.sysbar .label { font-weight:700; color:var(--text); margin-right:4px; }
+  footer.sysbar .metric b { color:var(--text); font-weight:600;
+                            font-variant-numeric:tabular-nums; }
+  footer.sysbar .metric.warn b { color:var(--medium); }
+  footer.sysbar .metric.high b { color:var(--high); }
+  footer.sysbar .metric.good b { color:var(--low); }
+  footer.sysbar .inner + .inner { margin-top:4px; }
+  @media (max-width: 700px) {
+    /* One scrollable line per row on a phone, not a wall of wrapped metrics.
+       After the base .inner rules, which would otherwise win. */
+    footer.sysbar { padding-left:12px; padding-right:12px; }
+    footer.sysbar .inner { flex-wrap:nowrap; overflow-x:auto; white-space:nowrap;
+                           scrollbar-width:none; -webkit-overflow-scrolling:touch; }
+    footer.sysbar .inner::-webkit-scrollbar { display:none; }
+  }
+  .pipeline-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:14px; }
+  .pipe-head { display:flex; justify-content:space-between; align-items:center; gap:10px;
+               flex-wrap:wrap; margin-bottom:12px; }
+  .demo-buttons { display:flex; gap:6px; flex-wrap:wrap; }
+  .lag-wrap { display:flex; align-items:center; gap:14px; }
+  .lag { font-size:30px; font-weight:800; font-variant-numeric:tabular-nums; letter-spacing:-0.02em;
+         min-width:4.2em; }
+  .lag.good { color:var(--low); } .lag.warn { color:var(--medium); } .lag.high { color:var(--high); }
+  .lag.off { color:var(--muted); font-size:16px; font-weight:600; }
+  .demo-buttons .btn { cursor:pointer; font:inherit; font-size:12px; padding:6px 10px; }
+  .demo-banner { background:rgba(122,162,255,0.10); border:1px solid rgba(122,162,255,0.35);
+                 border-radius:10px; padding:8px 12px; margin-bottom:12px; font-size:13px; }
+  .flow { display:flex; align-items:stretch; gap:6px; margin-bottom:16px; }
+  .flow .node { background:var(--panel-2); border:1px solid var(--line); border-radius:12px;
+                padding:10px 12px; min-width:0; flex:1 1 0; transition:border-color .3s; }
+  .flow .node.wide { flex:2.6 1 0; }
+  .flow .outs { display:flex; flex-direction:column; gap:6px; flex:1.1 1 0; min-width:0; }
+  .flow .outs .node { flex:1 1 auto; padding:7px 10px; }
+  .flow .arrow { display:flex; align-items:center; color:var(--muted); font-size:18px; flex:0 0 auto; }
+  .node .nh { display:flex; align-items:center; gap:7px; font-size:12px; font-weight:700;
+              text-transform:uppercase; letter-spacing:.05em; color:var(--muted); margin-bottom:6px; }
+  .node .nv { font-size:20px; font-weight:800; font-variant-numeric:tabular-nums; }
+  .node .ns { font-size:12px; color:var(--muted); margin-top:3px; overflow-wrap:anywhere; }
+  .node .dot { width:9px; height:9px; border-radius:50%; background:var(--line); flex:0 0 auto; }
+  .node.ok   { border-color:rgba(74,208,122,0.45); }   .node.ok .dot   { background:var(--low); }
+  .node.warn { border-color:rgba(255,176,32,0.55); }   .node.warn .dot { background:var(--medium); }
+  .node.bad  { border-color:rgba(255,92,92,0.6); }     .node.bad .dot  { background:var(--high); }
+  .node.active { border-color:var(--accent); }
+  .node.active .dot { background:var(--accent); animation:pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { box-shadow:0 0 0 0 rgba(122,162,255,.7); }
+                     50% { box-shadow:0 0 0 5px rgba(122,162,255,0); } }
+  @media (prefers-reduced-motion: reduce) { .node.active .dot { animation:none; } }
+  .states { display:flex; flex-wrap:wrap; gap:4px; margin-bottom:8px; }
+  .states span { font-size:11px; padding:2px 8px; border-radius:999px; border:1px solid var(--line);
+                 color:var(--muted); }
+  .states span.on { background:var(--accent); border-color:var(--accent); color:#0b0b0f; font-weight:700; }
+  .states span.on.bad { background:var(--high); border-color:var(--high); }
+  .states span.on.warn { background:var(--medium); border-color:var(--medium); }
+  .steps { display:grid; grid-template-columns:repeat(4,1fr); gap:4px; margin:8px 0 6px; }
+  .steps div { border:1px solid var(--line); border-radius:8px; padding:5px 6px; text-align:center; }
+  .steps b { display:block; font-size:11px; font-weight:700; }
+  .steps small { display:block; font-size:11px; color:var(--muted); font-variant-numeric:tabular-nums; }
+  .steps div.done { border-color:rgba(74,208,122,0.45); }
+  .steps div.now { border-color:var(--accent); background:rgba(122,162,255,0.12); }
+  .bar { height:5px; background:var(--line); border-radius:3px; overflow:hidden; }
+  .bar div { height:100%; width:0; background:var(--accent); transition:width .8s linear; }
+  @media (max-width: 900px) {
+    .flow { flex-direction:column; }
+    .flow .arrow { justify-content:center; transform:rotate(90deg); height:14px; }
+    .flow .node.wide, .flow .node, .flow .outs { flex:1 1 auto; }
+    .flow .outs { flex-direction:row; flex-wrap:wrap; }
+    .flow .outs .node { flex:1 1 140px; }
+  }
+  .pipeline-grid table td { padding:5px 8px; font-size:13px; }
 """
 
 NAV_TABS = [
@@ -439,11 +585,1595 @@ NAV_TABS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Activity layer: the loading screen, and anything loading after it
+# ---------------------------------------------------------------------------
+# On every page: a loading screen built from the browser's own measurements
+# (navigation timing, the Server-Timing header _StripUrlRoot adds, and every
+# fetch the page makes), shown again the moment a link is followed; then a
+# progress bar and pill for any request still running after 250 ms, a
+# spinner on the button that started it, red for failures, and a log of all
+# of it behind the footer's "Loaded in" badge. Repeated GETs to one URL are
+# the pages' polling and stay out of sight unless slow or failing.
+ACTIVITY_STYLES = """
+  /* --- Activity layer: loading screen, progress bar, pill, log ---------- */
+  #tv-boot { position:fixed; inset:0; z-index:1000; background:rgba(11,11,15,0.97);
+             display:flex; align-items:center; justify-content:center; padding:16px;
+             transition:opacity .35s ease; }
+  #tv-boot.fade { opacity:0; pointer-events:none; }
+  #tv-boot[hidden] { display:none; }
+  #tv-boot .panel { width:min(640px, 100%); max-height:calc(100vh - 32px); overflow:auto;
+                    background:var(--panel); border:1px solid var(--line); border-radius:16px;
+                    padding:18px 18px 14px; box-shadow:0 20px 60px rgba(0,0,0,.5); }
+  #tv-boot .top { display:flex; align-items:center; gap:12px; margin-bottom:4px; }
+  #tv-boot .title { font-weight:800; font-size:17px; letter-spacing:-0.01em; }
+  #tv-boot .elapsed { margin-left:auto; font-variant-numeric:tabular-nums; color:var(--muted);
+                      font-size:13px; }
+  #tv-boot .close { background:none; border:0; color:var(--muted); font-size:18px; cursor:pointer;
+                    padding:0 2px; }
+  #tv-boot .where { color:var(--muted); font-size:12px; margin-bottom:12px; overflow-wrap:anywhere; }
+  #tv-boot .meter { height:4px; background:var(--line); border-radius:2px; overflow:hidden;
+                    margin-bottom:12px; }
+  #tv-boot .meter div { height:100%; width:0; background:var(--accent); transition:width .25s ease; }
+  #tv-boot ol { list-style:none; margin:0; padding:0; font-size:13px; }
+  #tv-boot li { display:grid; grid-template-columns:18px 1fr auto; gap:8px; align-items:baseline;
+                padding:4px 0; border-bottom:1px solid rgba(42,42,56,.6); }
+  #tv-boot li .what { overflow-wrap:anywhere; }
+  #tv-boot li .what small { display:block; color:var(--muted); font-size:11px; }
+  #tv-boot li .ms { font-variant-numeric:tabular-nums; color:var(--muted); font-size:12px;
+                    white-space:nowrap; }
+  #tv-boot li.bg { opacity:.6; }
+  #tv-boot .ico { width:14px; height:14px; display:inline-block; text-align:center; line-height:14px;
+                  font-size:12px; }
+  #tv-boot .ok   .ico { color:var(--low); }
+  #tv-boot .fail .ico { color:var(--high); }
+  #tv-boot .fail .what { color:var(--high); }
+  #tv-boot .run  .ico { border:2px solid var(--line); border-top-color:var(--accent);
+                        border-radius:50%; animation:tvspin .8s linear infinite; width:10px; height:10px; }
+  #tv-boot .foot { color:var(--muted); font-size:11px; margin-top:10px; }
+  @keyframes tvspin { to { transform:rotate(360deg); } }
+
+  #tv-bar { position:fixed; top:0; left:0; right:0; height:3px; z-index:999; pointer-events:none;
+            opacity:0; transition:opacity .2s; overflow:hidden; }
+  #tv-bar.on { opacity:1; }
+  #tv-bar div { position:absolute; top:0; bottom:0; width:40%; background:var(--accent);
+                animation:tvslide 1.1s ease-in-out infinite; }
+  #tv-bar.err div { background:var(--high); animation:none; width:100%; }
+  @keyframes tvslide { from { left:-40%; } to { left:100%; } }
+
+  #tv-pill { position:fixed; right:14px; bottom:calc(var(--footer-h, 0px) + 10px); z-index:998; max-width:min(420px, calc(100vw - 28px));
+             background:var(--panel); border:1px solid var(--line); border-radius:999px;
+             padding:7px 14px; font-size:12px; display:flex; gap:8px; align-items:center;
+             box-shadow:0 8px 24px rgba(0,0,0,.4); cursor:pointer; transition:opacity .2s, transform .2s; }
+  #tv-pill[hidden] { display:none; }
+  #tv-pill.err { border-color:var(--high); color:var(--high); }
+  #tv-pill .spin { width:10px; height:10px; border:2px solid var(--line); border-top-color:var(--accent);
+                   border-radius:50%; animation:tvspin .8s linear infinite; flex:0 0 auto; }
+  #tv-pill span.t { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  button.tv-busy { position:relative; color:transparent !important; pointer-events:none; }
+  button.tv-busy::after { content:""; position:absolute; left:50%; top:50%; width:12px; height:12px;
+                          margin:-8px 0 0 -8px; border:2px solid var(--muted); border-top-color:var(--accent);
+                          border-radius:50%; animation:tvspin .8s linear infinite; }
+  .tv-loadbadge { cursor:pointer; text-decoration:underline dotted; }
+  @media (prefers-reduced-motion: reduce) {
+    #tv-bar div, #tv-pill .spin, #tv-boot .run .ico, button.tv-busy::after { animation:none; }
+  }
+"""
+
+ACTIVITY_HTML = """
+<noscript><style>#tv-boot { display:none !important; }</style></noscript>
+<div id="tv-boot" role="status" aria-live="polite">
+  <div class="panel">
+    <div class="top"><span class="title" id="tv-boot-title">Loading Tesla Vision</span>
+      <span class="elapsed" id="tv-boot-elapsed">0 ms</span>
+      <button class="close" id="tv-boot-close" title="Hide (Esc)" hidden>✕</button></div>
+    <div class="where" id="tv-boot-where"></div>
+    <div class="meter"><div id="tv-boot-meter"></div></div>
+    <ol id="tv-boot-steps"></ol>
+    <div class="foot" id="tv-boot-foot">Every line is measured by this browser, not estimated.</div>
+  </div>
+</div>
+<div id="tv-bar"><div></div></div>
+<div id="tv-pill" hidden title="Open the activity log"><span class="spin"></span><span class="t" id="tv-pill-text"></span></div>
+"""
+
+# Runs in <head>, before any page script, so its fetch wrapper sees every
+# request a page makes. Plain string (JavaScript braces). It only touches the
+# DOM once the body exists.
+ACTIVITY_SCRIPT = """
+<script>
+(function () {
+  "use strict";
+  const T0 = performance.now();   // ms since this navigation began
+  const log = [];                 // every request this page has made
+  const inflight = new Set();     // foreground requests still running
+  const seenGets = new Set();     // a GET URL seen before is a poll -> background
+  const BG_SLOW_MS = 3000, FG_SHOW_MS = 250;
+  let booted = false, bootDone = null, mode = "boot";   // boot | nav | log | hidden
+  let lastButton = null, lastButtonAt = 0;
+  const $ = (id) => document.getElementById(id);
+
+  function fmtMs(ms) { return ms < 1000 ? Math.round(ms) + " ms" : (ms / 1000).toFixed(ms < 10000 ? 2 : 1) + " s"; }
+  function fmtKB(bytes) { return bytes == null ? "" : bytes < 1024 ? bytes + " B" : (bytes / 1024).toFixed(bytes < 10240 ? 1 : 0) + " KB"; }
+  function shortPath(url) {
+    try { const u = new URL(url, location.href); return (u.origin === location.origin ? "" : u.host) + u.pathname + (u.search.length > 1 && u.search.length < 30 ? u.search : ""); }
+    catch (e) { return String(url); }
+  }
+  function serverMs(entry) {
+    const t = entry && entry.serverTiming && entry.serverTiming.find((s) => s.name === "app");
+    return t ? t.duration : null;
+  }
+  function timingFor(url) {
+    try {
+      const list = performance.getEntriesByName(new URL(url, location.href).href);
+      return list.length ? list[list.length - 1] : null;
+    } catch (e) { return null; }
+  }
+
+  // ---- The step list (loading screen and log view share it) -------------
+  const steps = [];
+  // Display order, whatever order things happen in: the footer's first
+  // fetches start before DOMContentLoaded, but connecting came first.
+  const RANK = {conn: 1, ttfb: 2, dl: 3, dom: 4, assets: 5, img: 30, ready: 99};
+  function step(key, what, detail) {
+    let s = steps.find((x) => x.key === key);
+    if (!s) {
+      s = {key, what, detail: detail || "", state: "run", ms: null, bg: false,
+           rank: RANK[key] || 10, seq: steps.length};
+      steps.push(s);
+      steps.sort((a, b) => a.rank - b.rank || a.seq - b.seq);
+    }
+    else { s.what = what; if (detail != null) s.detail = detail; }
+    render(); return s;
+  }
+  function settle(key, state, ms, detail) {
+    const s = steps.find((x) => x.key === key);
+    if (!s) return;
+    s.state = state; s.ms = ms; if (detail != null) s.detail = detail;
+    render();
+  }
+  function fillSizes() {
+    // A resource's timing entry (size, Server-Timing) appears only once its
+    // body has arrived - after fetch() resolves - so look it up late.
+    for (const r of log) {
+      if (r.state === "run" || r.sized) continue;
+      const t = timingFor(r.url);
+      if (!t) continue;
+      r.sized = true;
+      r.size = t.encodedBodySize || t.transferSize || null;
+      r.server = serverMs(t);
+      const s = steps.find((x) => x.key === "f" + r.id);
+      if (s) s.detail = (r.status ? "HTTP " + r.status : "") + (r.size ? " · " + fmtKB(r.size) : "") +
+                        (r.server != null ? " · Orin " + fmtMs(r.server) : "");
+    }
+  }
+  function render() {
+    const list = $("tv-boot-steps");
+    if (!list || mode === "hidden") return;
+    fillSizes();
+    const shown = mode === "log" ? steps.concat(log.filter((r) => r.after).map(logStep)) : steps;
+    list.replaceChildren(...shown.map((s) => {
+      const li = document.createElement("li");
+      li.className = s.state + (s.bg ? " bg" : "");
+      const ico = document.createElement("span"); ico.className = "ico";
+      ico.textContent = s.state === "ok" ? "✓" : s.state === "fail" ? "✗" : s.state === "info" ? "·" : "";
+      const what = document.createElement("span"); what.className = "what"; what.textContent = s.what;
+      if (s.detail) { const small = document.createElement("small"); small.textContent = s.detail; what.appendChild(small); }
+      const ms = document.createElement("span"); ms.className = "ms";
+      ms.textContent = s.ms != null ? fmtMs(s.ms) : s.state === "run" ? "…" : "";
+      li.append(ico, what, ms); return li;
+    }));
+    const done = steps.filter((s) => s.state !== "run").length;
+    const meter = $("tv-boot-meter");
+    if (meter) meter.style.width = (mode === "nav" ? 30 : Math.round(100 * done / Math.max(steps.length, 1))) + "%";
+  }
+  function logStep(r) {
+    return {key: "log" + r.id, what: r.method + " " + r.path,
+            detail: (r.status ? r.status + " · " : "") + (r.size != null ? fmtKB(r.size) + " · " : "") +
+                    (r.server != null ? "Orin " + fmtMs(r.server) + " · " : "") + (r.bg ? "background refresh · " : "") +
+                    new Date(r.wall).toLocaleTimeString(),
+            state: r.state, ms: r.ms, bg: r.bg};
+  }
+
+  // ---- fetch: every request, logged; foreground ones shown ----------------
+  const realFetch = window.fetch.bind(window);
+  let nextId = 1;
+  window.fetch = function (input, init) {
+    const url = typeof input === "string" ? input : (input && input.url) || String(input);
+    const method = ((init && init.method) || (input && input.method) || "GET").toUpperCase();
+    const path = shortPath(url);
+    const key = method + " " + path.split("?")[0];
+    const bg = (init && init.tvBackground) || (method === "GET" && seenGets.has(key));
+    if (method === "GET") seenGets.add(key);
+    const r = {id: nextId++, method, path, url, bg, state: "run", start: performance.now(), wall: Date.now(),
+               after: booted, status: null, ms: null, size: null, server: null,
+               quiet: Boolean(init && init.tvQuiet)};   // an expected 404 (e.g. no boxes yet)
+    log.push(r); if (log.length > 150) log.shift();
+    if (!booted) step("f" + r.id, method + " " + path, "requesting…");
+    if (!bg) { inflight.add(r); scheduleActivity(); }
+    if (method !== "GET" && lastButton && performance.now() - lastButtonAt < 400 && document.contains(lastButton)) {
+      r.button = lastButton; r.button.classList.add("tv-busy");
+    }
+    return realFetch(input, init).then((response) => {
+      finish(r, response.ok ? "ok" : "fail", response.status);
+      return response;
+    }, (error) => {
+      finish(r, "fail", null, error && error.name === "AbortError" ? "cancelled" : "network error");
+      throw error;
+    });
+  };
+  function finish(r, state, status, why) {
+    r.ms = performance.now() - r.start; r.state = state; r.status = status || why || null;
+    inflight.delete(r);
+    setTimeout(render, 300);   // by then the body is usually in: sizes appear
+    if (r.button) r.button.classList.remove("tv-busy");
+    if (!r.after) {
+      settle("f" + r.id, state, r.ms,
+        (status ? "HTTP " + status : why || "") + (r.size ? " · " + fmtKB(r.size) : "") +
+        (r.server != null ? " · Orin " + fmtMs(r.server) : ""));
+    }
+    if (state === "fail" && !r.quiet && (r.after || booted) && !(r.bg && why === "cancelled")) flashError(r);
+    else if (r.bg && r.ms > BG_SLOW_MS) flashSlow(r);
+    scheduleActivity();
+    if (mode === "log") render();
+    if (!booted) maybeBootDone();
+  }
+  document.addEventListener("click", (event) => {
+    const button = event.target.closest && event.target.closest("button");
+    if (button) { lastButton = button; lastButtonAt = performance.now(); }
+  }, true);
+
+  // ---- After load: top bar + pill for anything foreground -----------------
+  let activityTimer = null, pillHold = null;
+  function scheduleActivity() {
+    clearTimeout(activityTimer);
+    activityTimer = setTimeout(showActivity, inflight.size ? FG_SHOW_MS : 0);
+  }
+  function showActivity() {
+    if (!booted || mode === "nav") return;
+    const bar = $("tv-bar"), pill = $("tv-pill"), text = $("tv-pill-text");
+    if (!bar || !pill) return;
+    const running = [...inflight].filter((r) => performance.now() - r.start >= FG_SHOW_MS);
+    if (running.length) {
+      bar.className = "on";
+      const first = running[0];
+      text.textContent = first.method + " " + first.path + " · " + fmtMs(performance.now() - first.start) +
+                         (running.length > 1 ? " · +" + (running.length - 1) + " more" : "");
+      pill.className = ""; pill.hidden = false; pill.querySelector(".spin").hidden = false;
+      clearTimeout(activityTimer); activityTimer = setTimeout(showActivity, 200);
+    } else if (!pillHold) {
+      bar.className = ""; pill.hidden = true;
+    }
+  }
+  function flashError(r) {
+    const bar = $("tv-bar"), pill = $("tv-pill"), text = $("tv-pill-text");
+    if (!pill) return;
+    text.textContent = "✗ " + r.method + " " + r.path + " failed" + (r.status ? " (" + r.status + ")" : "");
+    pill.className = "err"; pill.hidden = false; pill.querySelector(".spin").hidden = true;
+    bar.className = "on err";
+    clearTimeout(pillHold);
+    pillHold = setTimeout(() => { pillHold = null; bar.className = ""; showActivity(); }, 6000);
+  }
+  function flashSlow(r) {
+    const pill = $("tv-pill"), text = $("tv-pill-text");
+    if (!pill || inflight.size) return;
+    text.textContent = "slow: " + r.method + " " + r.path + " took " + fmtMs(r.ms);
+    pill.className = ""; pill.hidden = false; pill.querySelector(".spin").hidden = true;
+    clearTimeout(pillHold);
+    pillHold = setTimeout(() => { pillHold = null; showActivity(); }, 4000);
+  }
+
+  // ---- The loading screen itself -------------------------------------------
+  function connectionLine() {
+    const host = location.hostname;
+    const direct = /^(\\d+\\.){3}\\d+$/.test(host) || host === "localhost";
+    const route = direct ? (host.startsWith("100.") ? "direct over the tailnet" : "direct on the local network")
+                         : "through Cloudflare (" + host + ")";
+    const net = navigator.connection && navigator.connection.effectiveType ? " · network " + navigator.connection.effectiveType : "";
+    return location.pathname + " · " + route + net;
+  }
+  function navigationSteps() {
+    const nav = performance.getEntriesByType("navigation")[0];
+    if (!nav) { step("nav", "Page received", "no navigation timing in this browser"); settle("nav", "info", null); return; }
+    const dns = nav.domainLookupEnd - nav.domainLookupStart;
+    const tcp = nav.connectEnd - nav.connectStart;
+    const tls = nav.secureConnectionStart > 0 ? nav.connectEnd - nav.secureConnectionStart : 0;
+    const wait = nav.responseStart - nav.requestStart;
+    const orin = serverMs(nav);
+    const reused = tcp <= 0 && dns <= 0;
+    step("conn", "Connected", reused ? "reused an open connection"
+      : "DNS " + fmtMs(dns) + " · TCP " + fmtMs(Math.max(0, tcp - tls)) + (tls ? " · TLS " + fmtMs(tls) : ""));
+    settle("conn", "ok", reused ? 0 : nav.connectEnd - nav.startTime);
+    step("ttfb", "Orin built the page", orin != null
+      ? "server " + fmtMs(orin) + " · network and tunnel " + fmtMs(Math.max(0, wait - orin))
+      : "first byte after " + fmtMs(wait));
+    settle("ttfb", "ok", wait);
+    const size = nav.encodedBodySize || nav.transferSize;
+    step("dl", "Page downloaded", nav.transferSize === 0 && nav.encodedBodySize > 0 ? "from browser cache" : fmtKB(size));
+    settle("dl", "ok", nav.responseEnd - nav.responseStart);
+  }
+  function parsedStep() {
+    const nav = performance.getEntriesByType("navigation")[0];
+    step("dom", "Page parsed", document.querySelectorAll("*").length + " elements");
+    // Called from DOMContentLoaded itself, when the browser has not yet
+    // stamped domContentLoadedEventEnd - so measure to now.
+    settle("dom", "ok", Math.max(0, performance.now() - (nav ? nav.responseEnd : T0)));
+  }
+  function assetSteps() {
+    const assets = performance.getEntriesByType("resource")
+      .filter((e) => e.initiatorType === "script" || e.initiatorType === "link" || e.initiatorType === "css");
+    if (!assets.length) return;
+    const slowest = Math.max(...assets.map((e) => e.duration));
+    step("assets", "Scripts and styles", assets.length + " file(s): " +
+         assets.map((e) => shortPath(e.name).split("/").pop()).join(", "));
+    settle("assets", "ok", slowest);
+  }
+  const images = [];
+  function watchImages() {
+    const visible = [...document.images].filter((img) => {
+      if (img.loading !== "lazy") return true;
+      const box = img.getBoundingClientRect();
+      return box.top < innerHeight && box.bottom > 0;
+    });
+    if (!visible.length) return;
+    images.push(...visible);
+    const started = performance.now();
+    const update = () => {
+      const done = images.filter((img) => img.complete).length;
+      const broken = images.filter((img) => img.complete && img.naturalWidth === 0).length;
+      step("img", "Images", done + " of " + images.length + " on screen" + (broken ? " · " + broken + " failed" : ""));
+      if (done === images.length) { settle("img", broken ? "fail" : "ok", performance.now() - started); maybeBootDone(); }
+    };
+    images.forEach((img) => { if (!img.complete) { img.addEventListener("load", update); img.addEventListener("error", update); } });
+    update();
+  }
+  let loadFired = false;
+  function maybeBootDone() {
+    if (booted || !loadFired) return;
+    if (steps.some((s) => s.state === "run")) return;
+    completeBoot(false);
+  }
+  function completeBoot(timedOut) {
+    if (booted) return;
+    booted = true;
+    bootDone = performance.now();   // performance.now() counts from the navigation's start
+    step("ready", timedOut ? "Shown before everything finished" : "Ready",
+         timedOut ? "some requests are still running; they continue in the background" : "");
+    settle("ready", timedOut ? "info" : "ok", performance.now());
+    const badge = document.querySelector(".tv-loadbadge b");
+    if (badge) badge.textContent = fmtMs(performance.now());
+    // ...#activity on the URL keeps the log open instead (handy for sharing
+    // what a slow load looked like).
+    setTimeout(() => (location.hash === "#activity" ? openLog() : hideOverlay()), timedOut ? 900 : 350);
+  }
+  function hideOverlay() {
+    const boot = $("tv-boot");
+    if (!boot || mode === "nav") return;
+    boot.classList.add("fade");
+    setTimeout(() => { if (mode !== "nav" && mode !== "log") { boot.hidden = true; boot.classList.remove("fade"); mode = "hidden"; } }, 380);
+  }
+  let elapsedTimer = null;
+  function tickElapsed(from) {
+    clearInterval(elapsedTimer);
+    elapsedTimer = setInterval(() => {
+      const el = $("tv-boot-elapsed");
+      if (el && (mode === "boot" || mode === "nav")) el.textContent = fmtMs(performance.now() - from);
+      if (mode === "hidden") clearInterval(elapsedTimer);
+    }, 100);
+  }
+
+  // ---- Leaving the page: show it from the very first moment ---------------
+  function showNavigating(target, label) {
+    const boot = $("tv-boot");
+    if (!boot) return;
+    mode = "nav";
+    steps.length = 0;
+    $("tv-boot-title").textContent = label;
+    $("tv-boot-where").textContent = target + " · waiting for the Orin to answer";
+    $("tv-boot-close").hidden = true;
+    step("req", "Request sent", "the next page appears as soon as its first byte arrives");
+    boot.hidden = false; boot.classList.remove("fade");
+    render(); tickElapsed(performance.now());
+  }
+  document.addEventListener("click", (event) => {
+    if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    const a = event.target.closest && event.target.closest("a[href]");
+    if (!a || a.target === "_blank" || a.hasAttribute("download")) return;
+    const url = new URL(a.href, location.href);
+    if (url.origin !== location.origin || (url.pathname === location.pathname && url.hash)) return;
+    if (url.pathname.indexOf("/media/") >= 0 || url.pathname.indexOf("/api/") >= 0) return;
+    showNavigating(url.pathname + url.search, "Loading " + (a.textContent.trim() || url.pathname).slice(0, 40));
+  });
+  window.addEventListener("beforeunload", () => { if (mode !== "nav") showNavigating(location.pathname, "Reloading"); });
+  window.addEventListener("pageshow", (event) => {
+    if (event.persisted) { mode = "hidden"; const boot = $("tv-boot"); if (boot) boot.hidden = true; }
+  });
+
+  // ---- The log view (footer badge) -----------------------------------------
+  function openLog() {
+    const boot = $("tv-boot");
+    if (!boot) return;
+    mode = "log";
+    $("tv-boot-title").textContent = "Activity log";
+    $("tv-boot-where").textContent = connectionLine() + " · page ready after " + fmtMs(bootDone || 0) +
+                                     " · " + log.length + " request(s) since";
+    $("tv-boot-elapsed").textContent = "";
+    $("tv-boot-close").hidden = false;
+    $("tv-boot-foot").textContent = "Faded rows are the automatic 5-second refreshes. Esc or ✕ to close.";
+    boot.hidden = false; boot.classList.remove("fade");
+    render();
+  }
+  function closeLog() {
+    if (mode !== "log") return;
+    mode = "hidden"; $("tv-boot").hidden = true;
+  }
+  window.tvActivity = {open: openLog, log};
+
+  document.addEventListener("DOMContentLoaded", () => {
+    $("tv-boot-where").textContent = connectionLine();
+    tickElapsed(0);
+    navigationSteps();
+    parsedStep();
+    $("tv-boot-close").addEventListener("click", closeLog);
+    $("tv-pill").addEventListener("click", openLog);
+    $("tv-boot").addEventListener("click", (event) => { if (event.target.id === "tv-boot") closeLog(); });
+    document.addEventListener("keydown", (event) => { if (event.key === "Escape") closeLog(); });
+    for (const badge of document.querySelectorAll(".tv-loadbadge")) badge.addEventListener("click", openLog);
+    watchImages();
+  });
+  window.addEventListener("load", () => {
+    loadFired = true;
+    assetSteps();
+    // Requests a page fires right on load get a moment to start.
+    setTimeout(maybeBootDone, 60);
+  });
+  // Never hold the page hostage: after 8 s, show it regardless.
+  setTimeout(() => { if (!booted) { loadFired = true; completeBoot(true); } }, 8000);
+})();
+</script>
+"""
+
+
+# ---------------------------------------------------------------------------
+# Media viewer: click any snapshot or GIF
+# ---------------------------------------------------------------------------
+VIEWER_STYLES = """
+  /* --- Media viewer: zoom for snapshots, play/scrub/zoom for GIFs -------- */
+  img.evidence { cursor:zoom-in; }
+  #vw { position:fixed; inset:0; z-index:1100; background:#050508; display:flex;
+        flex-direction:column; color:var(--text); user-select:none; -webkit-user-select:none; }
+  #vw[hidden] { display:none; }
+  /* The display rules below would otherwise beat the browser's [hidden]. */
+  #vw [hidden] { display:none !important; }
+  #vw .vw-top, #vw .vw-bottom { display:flex; align-items:center; gap:8px; padding:8px 12px;
+        background:rgba(21,21,29,0.92); border-color:var(--line); flex-wrap:wrap; }
+  #vw .vw-top { border-bottom:1px solid var(--line); }
+  #vw .vw-bottom { border-top:1px solid var(--line); }
+  #vw .vw-caption { font-size:13px; min-width:0; flex:1 1 200px; overflow:hidden; text-overflow:ellipsis;
+        white-space:nowrap; }
+  #vw .vw-caption small { color:var(--muted); margin-left:8px; }
+  #vw button, #vw select, #vw a.vw-btn { background:var(--panel-2); color:var(--text); border:1px solid var(--line);
+        border-radius:8px; padding:6px 10px; font:inherit; font-size:13px; cursor:pointer; line-height:1;
+        text-decoration:none; min-width:34px; text-align:center; }
+  #vw button:hover, #vw a.vw-btn:hover { border-color:var(--accent); }
+  #vw button.on { background:var(--accent); color:#0b0b0f; border-color:var(--accent); }
+  #vw button:disabled { opacity:.4; cursor:default; }
+  #vw .vw-zoom { font-variant-numeric:tabular-nums; font-size:12px; color:var(--muted); min-width:44px;
+        text-align:center; }
+  #vw .vw-stage { position:relative; flex:1 1 auto; overflow:hidden; touch-action:none; cursor:grab; }
+  #vw .vw-stage.dragging { cursor:grabbing; }
+  #vw .vw-media { position:absolute; left:0; top:0; transform-origin:0 0; max-width:none;
+        will-change:transform; image-rendering:auto; }
+  #vw .vw-media.pixels { image-rendering:pixelated; }
+  #vw .vw-nav { position:absolute; top:50%; transform:translateY(-50%); z-index:2; font-size:22px;
+        padding:14px 10px; opacity:.75; }
+  #vw .vw-nav.prev { left:10px; } #vw .vw-nav.next { right:10px; }
+  #vw .vw-msg { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+        color:var(--muted); font-size:14px; pointer-events:none; text-align:center; padding:20px; }
+  #vw .vw-scrub { flex:1 1 220px; accent-color:var(--accent); min-width:120px; }
+  #vw .vw-time { font-variant-numeric:tabular-nums; font-size:12px; color:var(--muted); min-width:120px; }
+  #vw .vw-help { color:var(--muted); font-size:11px; }
+  #vw .vw-overlay { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; z-index:1; }
+  #vw .vw-boxinfo { font-size:12px; color:var(--muted); font-variant-numeric:tabular-nums; }
+  @media (max-width: 700px) {
+    #vw .vw-help, #vw .vw-hide-narrow, #vw .vw-boxinfo { display:none; }
+    #vw .vw-nav { padding:10px 6px; font-size:18px; }
+  }
+"""
+
+VIEWER_HTML = """
+<div id="vw" hidden role="dialog" aria-modal="true" aria-label="Media viewer">
+  <div class="vw-top">
+    <div class="vw-caption" id="vw-caption"></div>
+    <span class="vw-boxinfo" id="vw-boxinfo"></span>
+    <button data-vw="boxes" id="vw-boxes" class="on" title="Detection boxes (B)">▣ Boxes</button>
+    <select id="vw-minconf" title="Only boxes at or above this confidence">
+      <option value="0">all</option><option value="0.5">≥ 0.50</option><option value="0.7">≥ 0.70</option>
+    </select>
+    <button data-vw="zoomout" title="Zoom out (-)">−</button>
+    <span class="vw-zoom" id="vw-zoom">100%</span>
+    <button data-vw="zoomin" title="Zoom in (+)">+</button>
+    <button data-vw="fit" title="Fit to screen (0)">Fit</button>
+    <button data-vw="actual" class="vw-hide-narrow" title="Actual pixels (1)">1:1</button>
+    <a class="vw-btn vw-hide-narrow" id="vw-open" target="_blank" title="Open the original file">↗</a>
+    <button data-vw="close" title="Close (Esc)">✕</button>
+  </div>
+  <div class="vw-stage" id="vw-stage">
+    <button class="vw-nav prev" data-vw="prev" title="Previous (PageUp)">‹</button>
+    <button class="vw-nav next" data-vw="next" title="Next (PageDown)">›</button>
+    <canvas class="vw-overlay" id="vw-overlay"></canvas>
+    <div class="vw-msg" id="vw-msg"></div>
+  </div>
+  <div class="vw-bottom" id="vw-gifbar" hidden>
+    <button data-vw="first" title="First frame (Home)">⏮</button>
+    <button data-vw="back" title="Previous frame (←)">◀︎❙</button>
+    <button data-vw="play" id="vw-play" title="Play / pause (space)">▶</button>
+    <button data-vw="fwd" title="Next frame (→)">❙▶︎</button>
+    <input type="range" class="vw-scrub" id="vw-scrub" min="0" max="0" value="0" aria-label="Scrub frames">
+    <span class="vw-time" id="vw-time">–</span>
+    <select id="vw-speed" title="Playback speed">
+      <option value="0.25">¼×</option><option value="0.5">½×</option>
+      <option value="1" selected>1×</option><option value="2">2×</option>
+    </select>
+    <button data-vw="loop" id="vw-loop" class="on" title="Loop">⟲</button>
+    <span class="vw-help">space play · ←/→ frame · B boxes · scroll or pinch to zoom · drag to pan · double-click to zoom in</span>
+  </div>
+</div>
+"""
+
+# A self-contained viewer. GIFs are decoded here (LZW, disposal, transparency,
+# interlacing) because no browser lets a page pause or seek an <img> GIF; the
+# frames go to a canvas, which is what makes play/pause, scrubbing and frame
+# stepping possible. No library and no CDN: it has to work in the car.
+VIEWER_SCRIPT = """
+<script>
+(function () {
+  "use strict";
+
+  // ---- GIF decoding ------------------------------------------------------
+  function lzw(minCodeSize, data, pixelCount) {
+    const out = new Uint8Array(pixelCount);
+    const clear = 1 << minCodeSize, eoi = clear + 1;
+    let codeSize = minCodeSize + 1, codeMask = (1 << codeSize) - 1, next = eoi + 1;
+    const prefix = new Int16Array(4096), suffix = new Uint8Array(4096), stack = new Uint8Array(4097);
+    for (let i = 0; i < clear; i++) { prefix[i] = -1; suffix[i] = i; }
+    let datum = 0, bits = 0, pos = 0, old = -1, first = 0, top = 0, o = 0;
+    while (o < pixelCount) {
+      if (top === 0) {
+        if (bits < codeSize) {
+          if (pos >= data.length) break;
+          datum |= data[pos++] << bits; bits += 8; continue;
+        }
+        let code = datum & codeMask; datum >>= codeSize; bits -= codeSize;
+        if (code === clear) { codeSize = minCodeSize + 1; codeMask = (1 << codeSize) - 1; next = eoi + 1; old = -1; continue; }
+        if (code === eoi) break;
+        if (old === -1) { stack[top++] = suffix[code]; old = code; first = code; continue; }
+        const inCode = code;
+        if (code >= next) { stack[top++] = first; code = old; }
+        while (code >= clear) { stack[top++] = suffix[code]; code = prefix[code]; }
+        first = suffix[code]; stack[top++] = first;
+        if (next < 4096) {
+          prefix[next] = old; suffix[next] = first; next++;
+          if ((next & codeMask) === 0 && next < 4096) { codeSize++; codeMask += next; }
+        }
+        old = inCode;
+      }
+      out[o++] = stack[--top];
+    }
+    return out;
+  }
+
+  function decodeGif(buffer) {
+    const b = new Uint8Array(buffer);
+    const sig = String.fromCharCode(b[0], b[1], b[2], b[3], b[4], b[5]);
+    if (sig !== "GIF87a" && sig !== "GIF89a") throw new Error("not a GIF");
+    const W = b[6] | (b[7] << 8), H = b[8] | (b[9] << 8), flags = b[10];
+    let p = 13, gct = null;
+    if (flags & 0x80) { const n = 3 * (1 << ((flags & 7) + 1)); gct = b.subarray(p, p + n); p += n; }
+    const frames = [];
+    let pixels = new Uint8ClampedArray(W * H * 4);
+    let gce = {delay: 0, disposal: 0, trans: -1};
+    const skipBlocks = () => { while (p < b.length && b[p] !== 0) p += b[p] + 1; p++; };
+    while (p < b.length) {
+      const block = b[p++];
+      if (block === 0x3B) break;
+      if (block === 0x21) {
+        const label = b[p++];
+        if (label === 0xF9 && b[p] >= 4) {
+          const packed = b[p + 1];
+          gce = {delay: (b[p + 2] | (b[p + 3] << 8)) * 10, disposal: (packed >> 2) & 7,
+                 trans: packed & 1 ? b[p + 4] : -1};
+        }
+        skipBlocks();
+        continue;
+      }
+      if (block !== 0x2C) throw new Error("bad GIF block 0x" + block.toString(16) + " at " + (p - 1));
+      const x = b[p] | (b[p + 1] << 8), y = b[p + 2] | (b[p + 3] << 8);
+      const w = b[p + 4] | (b[p + 5] << 8), h = b[p + 6] | (b[p + 7] << 8), f = b[p + 8];
+      p += 9;
+      let ct = gct;
+      if (f & 0x80) { const n = 3 * (1 << ((f & 7) + 1)); ct = b.subarray(p, p + n); p += n; }
+      const minCode = b[p++];
+      let total = 0;
+      for (let q = p; q < b.length && b[q] !== 0; q += b[q] + 1) total += b[q];
+      const data = new Uint8Array(total);
+      for (let o = 0; p < b.length && b[p] !== 0;) { const n = b[p++]; data.set(b.subarray(p, p + n), o); o += n; p += n; }
+      p++;
+      const indices = lzw(minCode, data, w * h);
+      // Interlaced images store rows in four passes; map stored -> actual.
+      const rows = [];
+      if (f & 0x40) {
+        for (const [start, step] of [[0, 8], [4, 8], [2, 4], [1, 2]]) for (let r = start; r < h; r += step) rows.push(r);
+      } else for (let r = 0; r < h; r++) rows.push(r);
+      const before = gce.disposal === 3 ? pixels.slice() : null;
+      if (ct) {
+        for (let k = 0; k < h; k++) {
+          const py = y + rows[k];
+          if (py >= H) continue;
+          for (let col = 0; col < w; col++) {
+            const idx = indices[k * w + col];
+            if (idx === gce.trans) continue;
+            const px = x + col;
+            if (px >= W) continue;
+            const d = (py * W + px) * 4, c = idx * 3;
+            pixels[d] = ct[c]; pixels[d + 1] = ct[c + 1]; pixels[d + 2] = ct[c + 2]; pixels[d + 3] = 255;
+          }
+        }
+      }
+      // Browsers play delays under 20 ms at 100 ms; match them.
+      frames.push({data: new ImageData(pixels.slice(), W, H), delay: gce.delay >= 20 ? gce.delay : 100});
+      if (gce.disposal === 2) {
+        for (let r = y; r < Math.min(y + h, H); r++) pixels.fill(0, (r * W + x) * 4, (r * W + Math.min(x + w, W)) * 4);
+      } else if (gce.disposal === 3 && before) {
+        pixels = before;
+      }
+      gce = {delay: 0, disposal: 0, trans: -1};
+    }
+    if (!frames.length) throw new Error("GIF has no frames");
+    return {width: W, height: H, frames};
+  }
+  window.tvDecodeGif = decodeGif;   // exposed for testing
+
+  // ---- The viewer ---------------------------------------------------------
+  const $ = (id) => document.getElementById(id);
+  let gallery = [], index = 0, media = null, natW = 0, natH = 0;
+  let scale = 1, tx = 0, ty = 0, fitScale = 1;
+  let gif = null, frame = 0, playing = false, speed = 1, loop = true, timer = null, loadToken = 0;
+  let boxes = null, boxesState = "", showBoxes = true, minConf = 0;
+  const MAX_SCALE = 16;
+  const BOX_COLOURS = {vehicle: "#7aa2ff", person: "#ffb020", plate: "#4ad07a", face: "#ff7ab6", other: "#c8c8d8"};
+
+  function stageBox() { return $("vw-stage").getBoundingClientRect(); }
+  function apply() {
+    if (!media) return;
+    media.style.transform = "translate(" + tx + "px," + ty + "px) scale(" + scale + ")";
+    media.classList.toggle("pixels", scale >= 2.5);
+    $("vw-zoom").textContent = Math.round(scale * 100) + "%";
+    drawBoxes();
+  }
+
+  // ---- Detection boxes ---------------------------------------------------
+  // Drawn on a screen-sized canvas over the picture rather than scaled with
+  // it, so lines and labels stay crisp and readable at any zoom.
+  function currentBoxes() {
+    if (!boxes || !boxes.frames || !boxes.frames.length) return null;
+    const i = gif ? Math.min(frame, boxes.frames.length - 1) : 0;
+    return (boxes.frames[i] || []).filter((b) => b.conf >= minConf);
+  }
+  function drawBoxes() {
+    const canvas = $("vw-overlay");
+    if (!canvas) return;
+    const box = stageBox(), ratio = window.devicePixelRatio || 1;
+    if (canvas.width !== Math.round(box.width * ratio) || canvas.height !== Math.round(box.height * ratio)) {
+      canvas.width = Math.round(box.width * ratio); canvas.height = Math.round(box.height * ratio);
+    }
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    ctx.clearRect(0, 0, box.width, box.height);
+    const list = currentBoxes();
+    updateBoxInfo(list);
+    if (!showBoxes || !list || !media) return;
+    ctx.font = "600 12px ui-sans-serif, system-ui, sans-serif";
+    ctx.textBaseline = "top";
+    for (const b of list) {
+      const x = tx + b.box[0] * natW * scale, y = ty + b.box[1] * natH * scale;
+      const w = b.box[2] * natW * scale, h = b.box[3] * natH * scale;
+      const colour = BOX_COLOURS[b.kind] || BOX_COLOURS.other;
+      ctx.lineWidth = 2; ctx.strokeStyle = colour;
+      ctx.strokeRect(x, y, w, h);
+      const text = b.label + " " + b.conf.toFixed(2);
+      const tw = ctx.measureText(text).width + 8, th = 17;
+      const ly = y - th >= 0 ? y - th : y;   // above the box unless it would leave the screen
+      ctx.fillStyle = colour; ctx.fillRect(x - 1, ly, tw, th);
+      ctx.fillStyle = "#0b0b0f"; ctx.fillText(text, x + 3, ly + 2);
+    }
+  }
+  function updateBoxInfo(list) {
+    const info = $("vw-boxinfo");
+    if (!info) return;
+    if (!boxes) { info.textContent = boxesState; return; }
+    if (!list || !list.length) { info.textContent = gif ? "no detections this frame" : "no detections"; return; }
+    const best = list.reduce((a, b) => (b.conf > a.conf ? b : a));
+    info.textContent = list.length + " detection" + (list.length === 1 ? "" : "s") +
+                       " · best " + best.label + " " + best.conf.toFixed(2);
+  }
+  async function loadBoxes(src, token) {
+    boxes = null;
+    boxesState = "";
+    try {
+      const response = await fetch(src + ".boxes.json", {cache: "no-store", tvQuiet: true});
+      if (token !== loadToken) return;
+      if (response.ok) boxes = await response.json();
+      else boxesState = /\\.gif(\\?|$)/i.test(src) ? "boxes pending: added when the processor is idle"
+                                                  : "no boxes recorded for this image";
+    } catch (error) {
+      boxesState = "";
+    }
+    if (token === loadToken) drawBoxes();
+  }
+  function clampPan() {
+    const box = stageBox(), w = natW * scale, h = natH * scale;
+    // Keep at least a quarter of the picture on screen.
+    tx = Math.min(box.width - w * 0.25, Math.max(-w * 0.75, tx));
+    ty = Math.min(box.height - h * 0.25, Math.max(-h * 0.75, ty));
+  }
+  function fit() {
+    const box = stageBox();
+    if (!natW || !natH) return;
+    // Small crops (plates, faces) are worth enlarging - up to 4x.
+    fitScale = Math.min(box.width / natW, box.height / natH, 4);
+    scale = fitScale;
+    tx = (box.width - natW * scale) / 2; ty = (box.height - natH * scale) / 2;
+    apply();
+  }
+  function zoomAt(factor, cx, cy) {
+    const box = stageBox();
+    if (cx == null) { cx = box.width / 2; cy = box.height / 2; }
+    const next = Math.min(MAX_SCALE, Math.max(fitScale * 0.5, scale * factor));
+    tx = cx - (cx - tx) * (next / scale); ty = cy - (cy - ty) * (next / scale);
+    scale = next; clampPan(); apply();
+  }
+  function actualSize() { zoomAt(1 / scale); }
+
+  function caption(img) {
+    const src = img.currentSrc || img.src;
+    const name = decodeURIComponent(src.split("/").pop().split("?")[0]);
+    const row = img.closest("tr, .card, .grid > *");
+    const context = row ? row.textContent.replace(/\\s+/g, " ").trim().slice(0, 90) : "";
+    return {name, context};
+  }
+
+  function setMedia(element) {
+    const stage = $("vw-stage");
+    if (media) media.remove();
+    media = element; media.classList.add("vw-media");
+    stage.insertBefore(media, $("vw-msg"));
+  }
+
+  function open(img) {
+    gallery = [...document.querySelectorAll("img.evidence, a[data-viewer]")].filter((el) => el.offsetParent !== null || el === img);
+    index = Math.max(0, gallery.indexOf(img));
+    $("vw").hidden = false;
+    document.documentElement.style.overflow = "hidden";
+    show(index);
+  }
+  function close() {
+    stopPlay(); loadToken++;
+    $("vw").hidden = true;
+    document.documentElement.style.overflow = "";
+    if (media) { media.remove(); media = null; }
+    gif = null; boxes = null; drawBoxes();
+  }
+  function srcOf(el) { return el.tagName === "A" ? el.href : (el.currentSrc || el.src); }
+
+  function show(i) {
+    stopPlay(); gif = null; frame = 0;
+    index = (i + gallery.length) % gallery.length;
+    const el = gallery[index], src = srcOf(el);
+    const token = ++loadToken;
+    const info = el.tagName === "A" ? {name: decodeURIComponent(src.split("/").pop()), context: el.title || ""} : caption(el);
+    $("vw-caption").textContent = info.name;
+    if (info.context) { const small = document.createElement("small"); small.textContent = info.context; $("vw-caption").appendChild(small); }
+    $("vw-open").href = src;
+    $("vw-msg").textContent = "Loading…";
+    for (const nav of document.querySelectorAll("#vw .vw-nav")) nav.hidden = gallery.length < 2;
+    const isGif = /\\.gif(\\?|$)/i.test(src);
+    $("vw-gifbar").hidden = !isGif;
+    loadBoxes(src, token);
+    if (isGif) loadGif(src, token); else loadImage(src, token);
+  }
+
+  function loadImage(src, token) {
+    const img = new Image();
+    img.onload = () => {
+      if (token !== loadToken) return;
+      natW = img.naturalWidth; natH = img.naturalHeight;
+      setMedia(img); $("vw-msg").textContent = ""; fit();
+      appendDims();
+    };
+    img.onerror = () => { if (token === loadToken) $("vw-msg").textContent = "Could not load " + src; };
+    img.src = src; img.alt = "";
+  }
+  function appendDims(extra) {
+    const small = document.createElement("small");
+    small.textContent = natW + "×" + natH + (extra ? " · " + extra : "");
+    $("vw-caption").appendChild(small);
+  }
+
+  async function loadGif(src, token) {
+    $("vw-msg").textContent = "Decoding GIF frames…";
+    try {
+      const response = await fetch(src);
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      const buffer = await response.arrayBuffer();
+      if (token !== loadToken) return;
+      const decoded = decodeGif(buffer);
+      if (token !== loadToken) return;
+      gif = decoded; natW = gif.width; natH = gif.height;
+      gif.starts = []; let t = 0;
+      for (const f of gif.frames) { gif.starts.push(t); t += f.delay; }
+      gif.duration = t;
+      const canvas = document.createElement("canvas");
+      canvas.width = natW; canvas.height = natH;
+      gif.ctx = canvas.getContext("2d");
+      setMedia(canvas); $("vw-msg").textContent = "";
+      $("vw-scrub").max = String(gif.frames.length - 1);
+      fit(); appendDims(gif.frames.length + " frames · " + (gif.duration / 1000).toFixed(1) + " s");
+      draw(0); play();
+    } catch (error) {
+      if (token !== loadToken) return;
+      // Fall back to the browser's own (unscrubbable) playback.
+      $("vw-gifbar").hidden = true;
+      loadImage(src, token);
+      setTimeout(() => { if (token === loadToken) $("vw-msg").textContent = ""; }, 10);
+      console.warn("GIF decode failed, showing it plainly:", error);
+    }
+  }
+  function draw(i) {
+    if (!gif) return;
+    frame = Math.max(0, Math.min(gif.frames.length - 1, i));
+    gif.ctx.putImageData(gif.frames[frame].data, 0, 0);
+    drawBoxes();
+    $("vw-scrub").value = String(frame);
+    $("vw-time").textContent = "frame " + (frame + 1) + "/" + gif.frames.length + " · " +
+      (gif.starts[frame] / 1000).toFixed(2) + " / " + (gif.duration / 1000).toFixed(2) + " s";
+  }
+  function tick() {
+    if (!playing || !gif) return;
+    let nextFrame = frame + 1;
+    if (nextFrame >= gif.frames.length) {
+      if (!loop) { stopPlay(); return; }
+      nextFrame = 0;
+    }
+    draw(nextFrame);
+    timer = setTimeout(tick, gif.frames[frame].delay / speed);
+  }
+  function play() {
+    if (!gif) return;
+    if (frame >= gif.frames.length - 1 && !loop) draw(0);
+    playing = true; $("vw-play").textContent = "❚❚";
+    clearTimeout(timer); timer = setTimeout(tick, gif.frames[frame].delay / speed);
+  }
+  function stopPlay() { playing = false; clearTimeout(timer); const b = $("vw-play"); if (b) b.textContent = "▶"; }
+  function step(delta) { stopPlay(); draw(frame + delta); }
+
+  // ---- Input: buttons, keys, wheel, drag, pinch, double-tap ----------------
+  const actions = {
+    close, fit, actual: actualSize,
+    zoomin: () => zoomAt(1.4), zoomout: () => zoomAt(1 / 1.4),
+    prev: () => show(index - 1), next: () => show(index + 1),
+    play: () => (playing ? stopPlay() : play()), back: () => step(-1), fwd: () => step(1),
+    first: () => step(-1e9),
+    boxes: () => { showBoxes = !showBoxes; $("vw-boxes").classList.toggle("on", showBoxes); drawBoxes(); },
+    loop: () => { loop = !loop; $("vw-loop").classList.toggle("on", loop); },
+  };
+  document.addEventListener("click", (event) => {
+    const button = event.target.closest && event.target.closest("[data-vw]");
+    if (button && !$("vw").hidden) { event.preventDefault(); actions[button.dataset.vw](); return; }
+    const target = event.target.closest && event.target.closest("img.evidence, a[data-viewer]");
+    if (!target || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey) return;
+    event.preventDefault(); event.stopPropagation();
+    open(target);
+  }, true);
+
+  document.addEventListener("keydown", (event) => {
+    if ($("vw").hidden) return;
+    const k = event.key;
+    const handled = {
+      "Escape": close, "+": actions.zoomin, "=": actions.zoomin, "-": actions.zoomout, "_": actions.zoomout,
+      "0": fit, "1": actualSize, "PageUp": actions.prev, "PageDown": actions.next,
+      "b": actions.boxes, "B": actions.boxes,
+      " ": () => gif && actions.play(), "Home": () => gif && actions.first(),
+      "ArrowLeft": () => (gif ? step(-1) : actions.prev()), "ArrowRight": () => (gif ? step(1) : actions.next()),
+    }[k];
+    if (handled) { event.preventDefault(); event.stopPropagation(); handled(); }
+  }, true);
+
+  document.addEventListener("DOMContentLoaded", () => {
+    const stage = $("vw-stage");
+    $("vw-scrub").addEventListener("input", (event) => { stopPlay(); draw(Number(event.target.value)); });
+    $("vw-speed").addEventListener("change", (event) => { speed = Number(event.target.value); if (playing) play(); });
+    $("vw-minconf").addEventListener("change", (event) => { minConf = Number(event.target.value); drawBoxes(); });
+    stage.addEventListener("wheel", (event) => {
+      event.preventDefault();
+      const box = stageBox();
+      zoomAt(Math.exp(-event.deltaY * (event.deltaMode === 1 ? 0.05 : 0.0015)), event.clientX - box.left, event.clientY - box.top);
+    }, {passive: false});
+
+    const pointers = new Map();
+    let pinch = null, lastTap = 0, moved = false;
+    stage.addEventListener("pointerdown", (event) => {
+      if (event.target.closest("button")) return;
+      stage.setPointerCapture(event.pointerId);
+      pointers.set(event.pointerId, {x: event.clientX, y: event.clientY});
+      moved = false;
+      if (pointers.size === 2) {
+        const [a, b] = [...pointers.values()];
+        pinch = {dist: Math.hypot(a.x - b.x, a.y - b.y), mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2};
+      }
+      stage.classList.add("dragging");
+    });
+    stage.addEventListener("pointermove", (event) => {
+      const prev = pointers.get(event.pointerId);
+      if (!prev) return;
+      const now = {x: event.clientX, y: event.clientY};
+      pointers.set(event.pointerId, now);
+      if (pointers.size === 2 && pinch) {
+        const [a, b] = [...pointers.values()];
+        const dist = Math.hypot(a.x - b.x, a.y - b.y), mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+        const box = stageBox();
+        tx += mx - pinch.mx; ty += my - pinch.my;
+        zoomAt(dist / pinch.dist, mx - box.left, my - box.top);
+        pinch = {dist, mx, my}; moved = true;
+      } else if (pointers.size === 1) {
+        const dx = now.x - prev.x, dy = now.y - prev.y;
+        if (Math.abs(dx) + Math.abs(dy) > 1) moved = true;
+        tx += dx; ty += dy; clampPan(); apply();
+      }
+    });
+    const release = (event) => {
+      pointers.delete(event.pointerId);
+      if (pointers.size < 2) pinch = null;
+      if (!pointers.size) stage.classList.remove("dragging");
+      if (event.type === "pointerup" && !moved && !event.target.closest("button")) {
+        const now = performance.now();
+        if (now - lastTap < 320) {           // double-click or double-tap
+          const box = stageBox();
+          if (scale > fitScale * 1.05) fit();
+          else zoomAt(Math.max(2.5, 3 * fitScale) / scale, event.clientX - box.left, event.clientY - box.top);
+          lastTap = 0;
+        } else lastTap = now;
+      }
+    };
+    stage.addEventListener("pointerup", release);
+    stage.addEventListener("pointercancel", release);
+    window.addEventListener("resize", () => { if (!$("vw").hidden) fit(); });
+  });
+  // ...#view=N opens the Nth snapshot on the page (counting from 0): a link
+  // straight to one piece of evidence.
+  window.addEventListener("load", () => {
+    const match = /^#view=(\\d+)$/.exec(location.hash);
+    if (!match) return;
+    const items = [...document.querySelectorAll("img.evidence, a[data-viewer]")];
+    if (items[Number(match[1])]) open(items[Number(match[1])]);
+  });
+})();
+</script>
+"""
+
+
+# ---------------------------------------------------------------------------
+# Orin box monitoring (the footer on every page)
+# ---------------------------------------------------------------------------
+# A container shares the host kernel, so /proc and /sys here describe the whole
+# Jetson, not just this container - which is exactly what the footer wants.
+# Every reader returns None rather than raising: a missing sensor should blank
+# one figure, never take a page down with it.
+
+_cpu_previous_sample: tuple[float, int, int] | None = None   # (monotonic, busy, total)
+
+# Junction temperature is the one the Orin throttles on; the others are fallbacks
+# for boards that name their zones differently.
+_THERMAL_PREFERENCE = ("tj-thermal", "cpu-thermal", "gpu-thermal", "soc0-thermal")
+
+
+def _read_cpu_times() -> tuple[int, int] | None:
+    try:
+        fields = [int(v) for v in Path("/proc/stat").read_text().split("\n", 1)[0].split()[1:]]
+    except (OSError, ValueError):
+        return None
+    idle = fields[3] + (fields[4] if len(fields) > 4 else 0)   # idle + iowait
+    total = sum(fields[:8])                                    # guest is already in user
+    return total - idle, total
+
+
+def _cpu_percent() -> float | None:
+    """Busy share since the previous call; a fresh 200 ms sample if that is stale."""
+    global _cpu_previous_sample
+    now = time.monotonic()
+    current = _read_cpu_times()
+    if current is None:
+        return None
+    previous = _cpu_previous_sample
+    if previous is None or now - previous[0] > 60:
+        time.sleep(0.2)
+        previous = (now, *current)
+        now = time.monotonic()
+        current = _read_cpu_times() or current
+    _cpu_previous_sample = (now, *current)
+    busy_delta, total_delta = current[0] - previous[1], current[1] - previous[2]
+    return round(100 * busy_delta / total_delta, 1) if total_delta > 0 else None
+
+
+def _meminfo() -> dict[str, int]:
+    values: dict[str, int] = {}
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            key, _, rest = line.partition(":")
+            values[key] = int(rest.split()[0]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return values
+
+
+def _read_number(path: str) -> float | None:
+    try:
+        return float(Path(path).read_text().strip())
+    # TypeError: a sysfs read that returns EAGAIN (the idle cv*-thermal zones)
+    # reaches Python 3.10's text decoder as None instead of an OSError.
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _temperature_c() -> tuple[str, float] | None:
+    readings: dict[str, float] = {}
+    for zone in Path("/sys/class/thermal").glob("thermal_zone*"):
+        try:
+            name = (zone / "type").read_text().strip()
+        except OSError:
+            continue
+        millidegrees = _read_number(str(zone / "temp"))
+        if millidegrees is not None and millidegrees > 0:
+            readings[name] = millidegrees / 1000
+    for name in _THERMAL_PREFERENCE:
+        if name in readings:
+            return name.removesuffix("-thermal"), round(readings[name], 1)
+    if readings:
+        name, value = max(readings.items(), key=lambda item: item[1])
+        return name.removesuffix("-thermal"), round(value, 1)
+    return None
+
+
+def system_stats() -> dict[str, Any]:
+    memory = _meminfo()
+    mem_total = memory.get("MemTotal")
+    mem_used = mem_total - memory["MemAvailable"] if mem_total and "MemAvailable" in memory else None
+    swap_total = memory.get("SwapTotal")
+    swap_used = swap_total - memory.get("SwapFree", 0) if swap_total else None
+
+    try:
+        disk = os.statvfs(BASE_DIR)
+        disk_total = disk.f_blocks * disk.f_frsize
+        disk_used = disk_total - disk.f_bavail * disk.f_frsize   # what we can still write
+    except OSError:
+        disk_total = disk_used = None
+
+    try:
+        load = [float(v) for v in Path("/proc/loadavg").read_text().split()[:3]]
+    except (OSError, ValueError):
+        load = None
+
+    gpu_load = _read_number("/sys/devices/platform/gpu.0/load")   # per mille
+    uptime = None
+    try:
+        uptime = float(Path("/proc/uptime").read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        pass
+    temperature = _temperature_c()
+
+    return {
+        "ts": int(time.time()),
+        "cpu_percent": _cpu_percent(),
+        "cpu_count": os.cpu_count(),
+        "load": load,
+        "mem_used": mem_used,
+        "mem_total": mem_total,
+        "swap_used": swap_used,
+        "swap_total": swap_total,
+        "disk_used": disk_used,
+        "disk_total": disk_total,
+        "disk_path": str(BASE_DIR),
+        "gpu_percent": round(gpu_load / 10, 1) if gpu_load is not None else None,
+        "temp_c": temperature[1] if temperature else None,
+        "temp_zone": temperature[0] if temperature else None,
+        "uptime_seconds": uptime,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Pipeline status (the queue, and how far behind the processor is)
+# ---------------------------------------------------------------------------
+# The processor rewrites logs/processor.json when a clip starts, when it ends
+# and every 5 s while idle; ingest writes logs/ingest.json every pass. Neither
+# goes through sqlite, for the reason _read_gps_heartbeat gives.
+
+# A heartbeat this old while idle means the processor is not running.
+PIPELINE_IDLE_STALE_SECONDS = 60
+# One clip taking this long means it is wedged, not slow: the worst case, a
+# 5 MP clip on the CPU fallback, is a couple of minutes.
+PIPELINE_CLIP_STUCK_SECONDS = 900
+
+# "Behind real time" is only meaningful while footage is arriving. With the
+# car away, now minus the newest analysed footage is just "when did I last
+# drive" - so past this, or with no car volume attached, it is not shown.
+LIVE_EDGE_MAX_AGE_SECONDS = 900
+
+
+def _read_json(path: Path) -> dict[str, Any] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def pipeline_status() -> dict[str, Any]:
+    from src.common import GIF_QUEUE_DIR, INBOX_DIR, LOGS_DIR
+    from src import clipqueue
+
+    now = time.time()
+    beat = _read_json(LOGS_DIR / "processor.json")
+    ingest = _read_json(LOGS_DIR / "ingest.json")
+
+    # The queue is read live from inbox/ rather than taken from the
+    # heartbeat: it is what is actually waiting, even mid-clip. A running
+    # demo's clips exist only in the processor, so during a demo the
+    # processor's own view (rewritten every second then) is used instead.
+    entries = clipqueue.queue_entries(INBOX_DIR)
+    current_name = ((beat or {}).get("current") or {}).get("name")
+    pending = [entry for entry in entries if entry["name"] != current_name]
+    demo = (beat or {}).get("demo")
+
+    result: dict[str, Any] = {"ts": int(now), "queue": clipqueue.summarize(pending, now)}
+    if demo and demo.get("active") and isinstance((beat or {}).get("queue"), dict):
+        result["queue"] = beat["queue"]
+    try:
+        result["gif_queue"] = sum(1 for _ in GIF_QUEUE_DIR.glob("*.json"))
+    except OSError:
+        result["gif_queue"] = None
+
+    if beat is None:
+        result.update(state="unknown", detail="the processor has not reported yet")
+    else:
+        age = now - (beat.get("ts") or 0)
+        current = beat.get("current")
+        if current:
+            current = dict(current)
+            current["elapsed_seconds"] = round(now - (current.get("started_ts") or now), 1)
+        if current and current["elapsed_seconds"] > PIPELINE_CLIP_STUCK_SECONDS:
+            state, detail = "stuck", f"one clip has run {int(current['elapsed_seconds'])}s"
+        elif not current and age > PIPELINE_IDLE_STALE_SECONDS:
+            state, detail = "down", f"no heartbeat for {int(age)}s"
+        elif current:
+            state, detail = "processing", None
+        elif beat.get("state") == "correlating" and age <= PIPELINE_IDLE_STALE_SECONDS:
+            state, detail = "correlating", None
+        elif beat.get("state") == "annotating" and age <= PIPELINE_IDLE_STALE_SECONDS:
+            state, detail = "annotating", f"idle-time detection boxes: {beat.get('annotating')}"
+        else:
+            state, detail = ("queued", "waiting for the next pass") if result["queue"]["depth"] else ("idle", None)
+        by_camera = beat.get("seconds_by_camera") or {}
+        overall = (sum(by_camera.values()) / len(by_camera)) if by_camera else None
+        queued_now = (result["queue"].get("next") or []) if demo and demo.get("active") else pending
+        result.update(
+            state=state, detail=detail, heartbeat_age_seconds=int(age),
+            current=current,
+            eta_seconds=(beat.get("eta_seconds") if demo and demo.get("active")
+                         else clipqueue.estimate_seconds(queued_now, by_camera, overall)),
+            **{key: beat.get(key) for key in (
+                "device", "has_gpu", "gpu_failures", "cpu_fallbacks", "gpu_retry_after",
+                "last_gpu_error", "realtime_factor", "seconds_by_camera", "last", "recent",
+                "processed_total", "errors_total", "last_error", "started_ts",
+                "alerts_total", "last_alert_ts", "last_correlation_ts", "last_correlation_raised",
+                "demo", "annotating", "boxes_pending",
+            )},
+        )
+
+    if ingest is None:
+        result["ingest"] = {"state": "unknown", "reason": "ingest has not reported"}
+    else:
+        result["ingest"] = {
+            "state": ingest.get("state"), "reason": ingest.get("reason"),
+            "age_seconds": int(now - (ingest.get("last_pass_ts") or 0)),
+            "copied_total": ingest.get("copied_total"), "last_copied": ingest.get("last_copied"),
+        }
+
+    # "Behind real time": which edge to count from, if any. The page ticks
+    # it every second between fetches, from edge_ts and the server clock.
+    demo_edge = (beat or {}).get("demo_edge_ts")
+    live_edge = (beat or {}).get("live_edge_ts")
+    car_attached = (result.get("ingest") or {}).get("state") in ("exported", "ready")
+    if demo and demo.get("active"):
+        result["lag"] = {"mode": "demo", "edge_ts": demo_edge}
+    elif live_edge and (car_attached or now - live_edge <= LIVE_EDGE_MAX_AGE_SECONDS):
+        result["lag"] = {"mode": "live", "edge_ts": live_edge}
+    elif car_attached:
+        result["lag"] = {"mode": "live", "edge_ts": None}
+    else:
+        result["lag"] = {"mode": "offline", "edge_ts": None}
+
+    # Path objects do not serialise; the queue summary only carries names.
+    return result
+
+
+# Plain string, not an f-string: it is JavaScript, and doubling every brace
+# would make it unreadable. Fills the footer render_page emits and refreshes
+# it every 5 s; a failed fetch leaves the last figures and dims the bar.
+SYSBAR_SCRIPT = """
+<script>
+(function () {
+  const bar = document.getElementById("sysbar");
+  if (!bar) return;
+  const footer = bar.closest("footer");
+  const setFooterHeight = () =>
+    document.documentElement.style.setProperty("--footer-h", footer.offsetHeight + "px");
+  setFooterHeight();
+  if (window.ResizeObserver) new ResizeObserver(setFooterHeight).observe(footer);
+  else window.addEventListener("resize", setFooterHeight);
+  const gib = (bytes) => (bytes / 1073741824).toFixed(1);
+  const level = (percent, warn, high) => percent >= high ? "high" : percent >= warn ? "warn" : "";
+  function put(key, text, cls) {
+    const el = bar.querySelector('[data-k="' + key + '"]');
+    if (!el) return;
+    el.className = "metric " + (cls || "");
+    el.querySelector("b").textContent = text;
+  }
+  function pct(used, total) { return total ? 100 * used / total : null; }
+  function duration(seconds) {
+    const d = Math.floor(seconds / 86400), h = Math.floor(seconds % 86400 / 3600),
+          m = Math.floor(seconds % 3600 / 60);
+    return d ? d + "d " + h + "h" : h ? h + "h " + m + "m" : m + "m";
+  }
+  async function refresh() {
+    let s;
+    try {
+      s = await (await fetch(URL_ROOT + "/api/system", {cache: "no-store"})).json();
+    } catch (error) {
+      bar.style.opacity = 0.5;
+      return;
+    }
+    bar.style.opacity = 1;
+    if (s.cpu_percent != null) {
+      const load = s.load ? " · load " + s.load[0].toFixed(2) : "";
+      put("cpu", s.cpu_percent.toFixed(0) + "%" + load, level(s.cpu_percent, 80, 95));
+    }
+    if (s.gpu_percent != null) put("gpu", s.gpu_percent.toFixed(0) + "%", level(s.gpu_percent, 80, 95));
+    const mem = pct(s.mem_used, s.mem_total);
+    if (mem != null) put("mem", gib(s.mem_used) + " / " + gib(s.mem_total) + " GB", level(mem, 80, 92));
+    const swap = pct(s.swap_used, s.swap_total);
+    if (swap != null) put("swap", gib(s.swap_used) + " / " + gib(s.swap_total) + " GB", level(swap, 60, 85));
+    const disk = pct(s.disk_used, s.disk_total);
+    if (disk != null) put("disk", disk.toFixed(0) + "% · " + gib(s.disk_total - s.disk_used) + " GB free",
+                          level(disk, 80, 90));
+    if (s.temp_c != null) put("temp", s.temp_c.toFixed(0) + "°C " + s.temp_zone, level(s.temp_c, 75, 90));
+    if (s.uptime_seconds != null) put("up", duration(s.uptime_seconds));
+  }
+  refresh();
+  setInterval(refresh, 5000);
+
+  // ---- Pipeline: the queue and how far behind the processor is ----------
+  const pipe = document.getElementById("pipebar");
+  const card = document.getElementById("pipeline-card");
+  const STATE_CLASS = {processing: "good", annotating: "good", idle: "", queued: "warn", down: "high",
+                       stuck: "high", unknown: "warn"};
+  function putPipe(key, text, cls, title) {
+    const el = pipe.querySelector('[data-k="' + key + '"]');
+    if (!el) return;
+    el.className = "metric " + (cls || "");
+    el.querySelector("b").textContent = text;
+    el.title = title || "";
+  }
+  function clipTime(ts) {
+    if (ts == null) return "?";
+    const when = new Date(ts * 1000), age = Date.now() / 1000 - ts;
+    return age < 86400 ? when.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"})
+                       : when.toLocaleString([], {month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"});
+  }
+  function ago(seconds) {
+    if (seconds == null) return "–";
+    if (seconds < 90) return Math.max(0, Math.round(seconds)) + "s ago";
+    return duration(seconds) + " ago";
+  }
+  function cameraLabel(c) { return (c || "?").replace("_", " "); }
+  function row(cells) {
+    const tr = document.createElement("tr");
+    for (const [text, cls] of cells) {
+      const td = document.createElement("td");
+      td.textContent = text;
+      if (cls) td.className = cls;
+      tr.appendChild(td);
+    }
+    return tr;
+  }
+  function fill(tbody, rows, empty) {
+    tbody.replaceChildren(...(rows.length ? rows : [row([[empty, "muted"]])]));
+  }
+  async function refreshPipeline() {
+    let p;
+    try {
+      p = await (await fetch(URL_ROOT + "/api/pipeline", {cache: "no-store"})).json();
+    } catch (error) {
+      pipe.style.opacity = 0.5;
+      return;
+    }
+    pipe.style.opacity = 1;
+    // skew: how far this browser's clock is from the Orin's, so the counter
+    // is right even when the phone and the Jetson disagree about the time.
+    lagState = p.lag ? {mode: p.lag.mode, edge_ts: p.lag.edge_ts, skew: Date.now() / 1000 - p.ts} : null;
+    tickLag();
+    const q = p.queue || {depth: 0, events: 0, next: []};
+    putPipe("pstate", "● " + p.state, STATE_CLASS[p.state] || "", p.detail || "");
+    if (p.current) {
+      putPipe("pnow", cameraLabel(p.current.camera) + " " + clipTime(p.current.captured_ts) +
+              " · " + Math.round(p.current.elapsed_seconds) + "s", "");
+    } else {
+      putPipe("pnow", "–", "");
+    }
+    putPipe("pqueue", q.depth + (q.events ? " (" + q.events + " events)" : ""),
+            q.depth > 30 ? "high" : q.depth > 6 ? "warn" : "");
+    putPipe("peta", q.depth === 0 ? "clear" : p.eta_seconds != null ? "~" + duration(Math.max(60, p.eta_seconds)) : "?",
+            p.eta_seconds > 900 ? "high" : p.eta_seconds > 120 ? "warn" : "");
+    const gpuResting = p.gpu_retry_after && p.gpu_retry_after * 1000 > Date.now();
+    const device = p.device === "cuda" ? "GPU" : p.has_gpu ? "CPU (GPU resting)" : "CPU";
+    putPipe("pspeed", (p.realtime_factor != null ? p.realtime_factor.toFixed(2) + "× real time · " : "") + device,
+            gpuResting ? "warn" : p.realtime_factor == null ? "" : p.realtime_factor < 0.9 ? "good" : p.realtime_factor < 1 ? "warn" : "high",
+            (p.last_gpu_error ? "last GPU error: " + p.last_gpu_error + ". " : "") +
+            (p.cpu_fallbacks ? p.cpu_fallbacks + " clip(s) re-run on the CPU" : ""));
+    putPipe("pfresh", p.last ? clipTime(p.last.captured_ts) : "–", "");
+    const ingest = p.ingest || {};
+    putPipe("pingest", ingest.state === "ready" ? "copying" : (ingest.state || "?"),
+            ingest.state === "ready" ? "good" : "", ingest.reason || "");
+
+    if (card) renderFlow(p, q);
+  }
+
+  // ---- The flow diagram on the Recent page --------------------------------
+  function setNode(id, cls, value, sub) {
+    const node = document.getElementById(id);
+    if (!node) return;
+    node.className = "node" + (node.classList.contains("wide") ? " wide" : "") + (cls ? " " + cls : "");
+    const nv = node.querySelector(".nv"), ns = node.querySelector(".ns");
+    if (nv && value != null) nv.textContent = value;
+    if (ns && sub != null) ns.textContent = sub;
+  }
+  function since(ts) { return ts ? ago(Date.now() / 1000 - ts) : "never"; }
+  const INGEST_VIEW = {
+    exported: ["ok", "Recording", "the car owns the drive; clips are copied when it is released"],
+    ready: ["active", "Mounted", "drive readable, ingest copying"],
+    absent: ["", "Not connected", "car not plugged in, or drive not mounted"],
+  };
+
+  function renderFlow(p, q) {
+    const demo = p.demo && p.demo.active ? p.demo : null;
+    const ingest = p.ingest || {};
+
+    // Car drive (or the demo feed standing in for it)
+    if (demo) {
+      setNode("n-car", "active", "NATIX demo",
+        demo.released + "/" + demo.total + " clips released" +
+        (demo.next_release_in != null ? " · next minute in " + demo.next_release_in + "s" : ""));
+    } else {
+      const view = INGEST_VIEW[ingest.state] || ["warn", ingest.state || "unknown", ingest.reason || ""];
+      setNode("n-car", view[0], view[1], view[2]);
+    }
+
+    // Ingest
+    const ingestStale = ingest.age_seconds != null && ingest.age_seconds > 120;
+    setNode("n-ingest",
+      ingest.state === "unknown" || ingestStale ? "bad" : ingest.state === "ready" ? "active" : "",
+      (ingest.copied_total || 0) + " copied",
+      ingestStale ? "no heartbeat for " + duration(ingest.age_seconds)
+                  : ingest.last_copied ? "last: " + ingest.last_copied : "nothing copied since it started");
+
+    // Queue
+    const eta = q.depth === 0 ? "empty" : p.eta_seconds != null ? "clears in ~" + duration(Math.max(60, p.eta_seconds)) : "";
+    setNode("n-queue", q.depth > 30 ? "bad" : q.depth > 6 ? "warn" : q.depth ? "active" : "ok",
+      String(q.depth),
+      [q.events ? q.events + " events" : "", q.demo ? q.demo + " demo" : "", eta].filter(Boolean).join(" · "));
+
+    // Processor: state machine, current clip, step tracker
+    const resting = p.gpu_retry_after && p.gpu_retry_after * 1000 > Date.now();
+    const machine = (p.state === "down" || p.state === "stuck") ? "down"
+                  : (p.state === "processing" && p.current && p.current.device === "cpu" && p.has_gpu) ? "fallback"
+                  : p.state;
+    for (const chip of document.querySelectorAll("#proc-states span")) {
+      const on = chip.dataset.s === machine;
+      chip.className = on ? "on" + (machine === "down" ? " bad" : machine === "fallback" ? " warn" : "") : "";
+    }
+    setNode("n-proc", machine === "down" ? "bad" : machine === "fallback" ? "warn"
+                     : (machine === "processing" || machine === "correlating" || machine === "annotating") ? "active" : "ok");
+    document.getElementById("proc-device").textContent =
+      (p.device === "cuda" ? "GPU" : p.has_gpu ? "CPU · GPU resting" : "CPU") +
+      (p.realtime_factor != null ? " · " + p.realtime_factor.toFixed(2) + "× real time" : "");
+
+    const c = p.current;
+    const order = ["detect", "plates", "faces", "saving"];
+    const stepText = {
+      detect: c ? c.frames_done + "/" + c.frames_budget + " frames" : "–",
+      plates: c ? (c.plate_budget ? c.plate_frames + "/" + c.plate_budget : "off") : "–",
+      faces: c ? (c.face_budget ? c.face_frames + "/" + c.face_budget : "off") : "–",
+      saving: c ? (c.demo ? "summary only" : "alerts, GIF") : "–",
+    };
+    const nowIndex = c ? order.indexOf(c.stage) : -1;
+    for (const box of document.querySelectorAll("#proc-steps > div")) {
+      const index = order.indexOf(box.dataset.step);
+      // Plates and faces run inside the frame loop, so "done" is by count.
+      const finished = c && (box.dataset.step === "detect" ? c.frames_done >= c.frames_budget || nowIndex === 3
+                           : box.dataset.step === "saving" ? false : nowIndex === 3);
+      box.className = c && index === nowIndex ? "now" : finished ? "done" : "";
+      box.querySelector("small").textContent = stepText[box.dataset.step];
+    }
+    document.getElementById("proc-bar").style.width =
+      c ? Math.min(100, Math.round(100 * (c.stage === "saving" ? 1 : c.frames_done / (c.frames_budget || 1)))) + "%" : "0%";
+    document.getElementById("proc-clip").textContent = c
+      ? (c.demo ? "DEMO · " : "") + cameraLabel(c.camera) + " " + clipTime(c.captured_ts) +
+        (c.source ? " · " + c.source.replace("Clips", "") : "") + " · " + Math.round(c.elapsed_seconds) + "s" +
+        " · " + c.vehicles + " vehicle / " + c.people + " person hits"
+      : p.state === "correlating" ? "re-scoring identities…"
+      : p.state === "annotating" ? "adding detection boxes to " + p.annotating + (p.boxes_pending > 1 ? " · " + (p.boxes_pending - 1) + " more" : "")
+      : (p.detail || "waiting for clips");
+    document.getElementById("proc-foot").textContent =
+      (p.processed_total || 0) + " clips since start" +
+      (p.cpu_fallbacks ? " · " + p.cpu_fallbacks + " on CPU fallback" : "") +
+      (p.errors_total ? " · " + p.errors_total + " errors" : "") +
+      (resting && p.last_gpu_error ? " · GPU: " + p.last_gpu_error : "");
+
+    // Outputs
+    setNode("n-gif", p.gif_queue ? "active" : "ok", null,
+      p.gif_queue ? p.gif_queue + " GIF" + (p.gif_queue === 1 ? "" : "s") + " rendering" : "idle");
+    setNode("n-corr", p.state === "correlating" ? "active" : p.last_correlation_raised ? "warn" : "ok", null,
+      p.state === "correlating" ? "running…" : "last run " + since(p.last_correlation_ts) +
+      (p.last_correlation_raised ? " · " + p.last_correlation_raised + " new finding(s)" : ""));
+    setNode("n-alerts", p.alerts_total ? "warn" : "ok", null,
+      (p.alerts_total || 0) + " since start · last " + since(p.last_alert_ts));
+
+    // Headline, demo banner and buttons
+    const headline = document.getElementById("pipeline-headline");
+    headline.textContent = q.depth === 0
+      ? (p.last ? "Caught up · newest footage analysed " + clipTime(p.last.captured_ts) : "Caught up")
+      : q.depth + " waiting" + (p.eta_seconds != null ? ", clears in ~" + duration(Math.max(60, p.eta_seconds)) : "");
+    const banner = document.getElementById("demo-banner");
+    const d = p.demo;
+    if (d && (d.active || d.finished_ts || d.stopped) && Date.now() / 1000 - (d.finished_ts || d.started_ts) < 3600) {
+      banner.hidden = false;
+      const lag = d.max_lag_seconds != null ? " · worst wait from arrival to result " + Math.round(d.max_lag_seconds) + "s" : "";
+      banner.textContent = d.active
+        ? "Demo (" + d.mode + "): " + d.done + "/" + d.total + " clips analysed in " + duration(d.elapsed_seconds) + lag +
+          ". Nothing is saved: results appear below only."
+        : (d.stopped ? "Demo stopped: " : "Demo finished: ") + d.done + "/" + d.total + " clips in " +
+          duration(d.elapsed_seconds) + lag + (d.mode === "realtime" && d.max_lag_seconds != null
+            ? (d.max_lag_seconds < 60 ? " — kept up with the car." : " — fell behind the car.") : "");
+    } else {
+      banner.hidden = true;
+    }
+    for (const button of document.querySelectorAll("[data-demo]")) {
+      button.hidden = (button.dataset.demo === "stop") !== Boolean(demo);
+    }
+
+    fill(document.getElementById("pipeline-next"), (q.next || []).map((clip) => row([
+      [clipTime(clip.captured_ts)], [cameraLabel(clip.camera)],
+      [clip.demo ? "demo" : clip.source ? clip.source.replace("Clips", "") : "",
+       clip.demo ? "pill low" : clip.source && clip.source !== "RecentClips" ? "pill medium" : "muted"],
+    ])), "Nothing waiting");
+    fill(document.getElementById("pipeline-recent"), (p.recent || []).map((clip) => {
+      const r = clip.result;
+      const found = r ? r.vehicles + " veh · " + r.people + " ppl" + (r.plate ? " · " + r.plate : "") +
+                        (r.faces ? " · " + r.faces + " face" + (r.faces === 1 ? "" : "s") : "") : "";
+      const tr = row([
+        [clipTime(clip.captured_ts)], [cameraLabel(clip.camera)],
+        [clip.seconds + "s " + (clip.device === "cuda" ? "GPU" : "CPU"), clip.device === "cuda" ? "" : "muted"],
+        [found, "muted"],
+        [clip.demo ? "demo" : clip.alert ? "alert" : "", clip.demo ? "pill low" : clip.alert ? "pill high" : ""],
+      ]);
+      if (r && r.snapshot) {
+        const link = document.createElement("a");
+        link.href = URL_ROOT + "/media/" + r.snapshot;
+        link.target = "_blank";
+        link.textContent = "📷";
+        link.title = "best frame from this demo clip";
+        link.dataset.viewer = "1";
+        const td = document.createElement("td");
+        td.appendChild(link);
+        tr.appendChild(td);
+      }
+      return tr;
+    }), "Nothing yet since the processor started");
+  }
+
+  for (const button of document.querySelectorAll("[data-demo]")) {
+    button.addEventListener("click", async () => {
+      const action = button.dataset.demo === "stop" ? "stop" : "start";
+      button.disabled = true;
+      try {
+        const response = await fetch(URL_ROOT + "/api/demo", {
+          method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({action: action, mode: action === "start" ? button.dataset.demo : null}),
+        });
+        const answer = await response.json();
+        if (!answer.ok) alert("Demo: " + answer.error);
+      } catch (error) {
+        alert("Demo request failed: " + error);
+      } finally {
+        button.disabled = false;
+        setTimeout(refreshPipeline, 1200);
+      }
+    });
+  }
+  // ---- "Behind real time", ticking every second between fetches --------
+  let lagState = null;   // {mode, edge_ts, skew}
+  function lagText(seconds) {
+    seconds = Math.max(0, Math.round(seconds));
+    if (seconds < 100) return "−" + seconds + " s";
+    const m = Math.floor(seconds / 60), s = seconds % 60;
+    if (m < 60) return "−" + m + ":" + String(s).padStart(2, "0");
+    return "−" + duration(seconds);
+  }
+  function tickLag() {
+    const big = document.getElementById("lag-big");
+    const label = document.getElementById("lag-label");
+    let text = "–", cls = "off", note = "behind real time", title = "";
+    if (lagState) {
+      if (lagState.mode === "offline") {
+        text = "no live footage"; note = "car not connected";
+      } else if (lagState.edge_ts == null) {
+        text = "waiting"; note = lagState.mode === "demo" ? "demo: first clip in progress" : "for the first clip";
+      } else {
+        const behind = Date.now() / 1000 - lagState.skew - lagState.edge_ts;
+        text = lagText(behind);
+        cls = behind < 150 ? "good" : behind < 300 ? "warn" : "high";
+        note = lagState.mode === "demo" ? "behind real time (demo clock)" : "behind real time";
+      }
+    }
+    putPipe("pbehind", text, cls === "off" ? "" : cls, note);
+    if (big) { big.textContent = text; big.className = "lag " + cls; }
+    if (label) label.textContent = note;
+  }
+  if (pipe) {
+    refreshPipeline();
+    setInterval(refreshPipeline, 5000);
+    setInterval(tickLag, 1000);
+  }
+})();
+</script>
+"""
+
+PIPELINE_METRICS = [
+    ("pstate", "Pipeline"), ("pbehind", "Behind real time"), ("pnow", "Now"), ("pqueue", "Queue"), ("peta", "Clears in"),
+    ("pspeed", "Speed"), ("pfresh", "Newest done"), ("pingest", "Ingest"),
+]
+
+SYSBAR_METRICS = [
+    ("cpu", "CPU"), ("gpu", "GPU"), ("mem", "RAM"), ("swap", "Swap"),
+    ("disk", "Disk"), ("temp", "Temp"), ("up", "Up"),
+]
+
+
 def render_page(title: str, body: str, active_path: str = "", head_extra: str = "") -> HTMLResponse:
     """Wrap page content in the shared shell (nav, styles, viewport)."""
     tabs = "".join(
-        f'<a class="tab{" active" if path == active_path else ""}" href="{path}">{esc(label)}</a>'
+        f'<a class="tab{" active" if path == active_path else ""}" href="{URL_ROOT}{path}">{esc(label)}</a>'
         for path, label in NAV_TABS
+    )
+    # Page scripts that live in plain (non-f) strings build their URLs from
+    # this, so it has to be defined before head_extra or the body run.
+    url_root_js = json.dumps(URL_ROOT).replace("<", "\\u003c")
+    sysbar = "".join(
+        f'<span class="metric" data-k="{key}">{label} <b>–</b></span>'
+        for key, label in SYSBAR_METRICS
+    )
+    pipebar = "".join(
+        f'<span class="metric" data-k="{key}">{"" if key == "pstate" else label + " "}<b>–</b></span>'
+        for key, label in PIPELINE_METRICS
     )
 
     return HTMLResponse(f"""<!doctype html>
@@ -451,15 +2181,32 @@ def render_page(title: str, body: str, active_path: str = "", head_extra: str = 
   <meta charset="utf-8" />
   <title>{esc(title)} - Tesla Vision</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>{PAGE_STYLES}</style>
+  <style>{PAGE_STYLES}{ACTIVITY_STYLES}{VIEWER_STYLES}</style>
+  <script>var URL_ROOT = {url_root_js};</script>
+  {ACTIVITY_SCRIPT}
   {head_extra}
 </head>
 <body>
+  {ACTIVITY_HTML}
   <header><nav>
     <span class="brand">🛰️ Tesla Vision</span>
     {tabs}
   </nav></header>
   <main>{body}</main>
+  <footer class="sysbar">
+    <div class="inner" id="pipebar">
+      <span class="label">Pipeline</span>
+      {pipebar}
+    </div>
+    <div class="inner" id="sysbar">
+      <span class="label">Orin box</span>
+      {sysbar}
+      <span class="metric tv-loadbadge" title="Open the loading and activity log">⚡ Loaded in <b>…</b></span>
+    </div>
+  </footer>
+  {SYSBAR_SCRIPT}
+  {VIEWER_HTML}
+  {VIEWER_SCRIPT}
 </body></html>""")
 
 
@@ -499,6 +2246,50 @@ def _list_alerts() -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # JSON API - mirrors Scout's app/server/routes/api/*
 # ---------------------------------------------------------------------------
+
+@app.get("/api/pipeline")
+def api_pipeline():
+    return pipeline_status()
+
+
+@app.post("/api/demo")
+async def api_demo(request: Request):
+    """
+    Start or stop the NATIX replay. The processor owns the models and the GPU,
+    so this only leaves it a request in jobs/; it picks that up within a second.
+
+    JSON only: a cross-site HTML form cannot send application/json without a
+    CORS preflight this app never answers, so a link on another site cannot
+    start a demo with the viewer's credentials.
+    """
+    from src.common import BASE_DIR, JOBS_DIR
+    if "application/json" not in (request.headers.get("content-type") or ""):
+        return JSONResponse({"ok": False, "error": "expected application/json"}, status_code=415)
+    try:
+        body = await request.json()
+    except ValueError:
+        body = None
+    action = body.get("action") if isinstance(body, dict) else None
+    mode = body.get("mode") if isinstance(body, dict) else None
+    if action not in ("start", "stop") or (action == "start" and mode not in ("realtime", "backlog")):
+        return JSONResponse({"ok": False, "error": "action must be start (mode realtime|backlog) or stop"},
+                            status_code=400)
+    clips_dir = Path(os.environ.get("DEMO_CLIPS_DIR", str(BASE_DIR / "natix-stray")))
+    if action == "start" and not any(clips_dir.rglob("*.mp4")):
+        return JSONResponse({"ok": False, "error": f"no demo clips under {clips_dir}"}, status_code=409)
+    JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    target = JOBS_DIR / "demo.json"
+    temporary = JOBS_DIR / ".demo.json.tmp"
+    temporary.write_text(json.dumps({"action": action, "mode": mode, "ts": int(time.time())}),
+                         encoding="utf-8")
+    os.replace(temporary, target)
+    return {"ok": True, "action": action, "mode": mode}
+
+
+@app.get("/api/system")
+def api_system():
+    return system_stats()
+
 
 @app.get("/healthz")
 def healthz():
@@ -829,7 +2620,7 @@ def index(limit: int = 25):
     if top_findings:
         items = "".join(
             f'<div style="padding:6px 0;">{severity_pill(row["severity"])} '
-            f'<a href="/entity/{esc(row["entity_type"])}/{esc(row["entity_id"])}">'
+            f'<a href="{URL_ROOT}/entity/{esc(row["entity_type"])}/{esc(row["entity_id"])}">'
             f'<b>{esc(row["entity_label"])}</b></a> '
             f'<span class="muted">scored {esc(row["score"])}/100</span></div>'
             for row in top_findings
@@ -838,7 +2629,7 @@ def index(limit: int = 25):
             '<div class="card" style="border-color:var(--high);">'
             '<div style="font-weight:800; margin-bottom:6px;">⚠️ Active surveillance findings</div>'
             f'{items}'
-            '<div style="margin-top:8px;"><a href="/findings">See all findings →</a></div>'
+            f'<div style="margin-top:8px;"><a href="{URL_ROOT}/findings">See all findings →</a></div>'
             '</div>'
         )
 
@@ -852,7 +2643,7 @@ def index(limit: int = 25):
 
     more_link = (
         f'<div style="text-align:center; padding:16px;">'
-        f'<a class="btn" href="/?limit={limit + 50}">Show more '
+        f'<a class="btn" href="{URL_ROOT}/?limit={limit + 50}">Show more '
         f'({limit} of {total_alerts})</a></div>'
         if total_alerts > limit else ""
     )
@@ -864,8 +2655,8 @@ def index(limit: int = 25):
         # loading="lazy" matters more than it looks: GIF previews are megabytes
         # each and this view lists many alerts, so eager loading would pull the
         # whole media directory on one page load over a phone hotspot.
-        jpeg_tag = f'<img class="evidence" loading="lazy" src="/media/{esc(jpeg)}" style="max-width:420px;" />' if jpeg else ""
-        gif_tag = f'<img class="evidence" loading="lazy" src="/media/{esc(gif)}" style="max-width:420px;" />' if gif else ""
+        jpeg_tag = f'<img class="evidence" loading="lazy" src="{URL_ROOT}/media/{esc(jpeg)}" style="max-width:420px;" />' if jpeg else ""
+        gif_tag = f'<img class="evidence" loading="lazy" src="{URL_ROOT}/media/{esc(gif)}" style="max-width:420px;" />' if gif else ""
 
         extra = ""
         if alert.get("plate"):
@@ -895,6 +2686,63 @@ def index(limit: int = 25):
       <h1>Recent activity</h1>
       <div class="sub">Newest detections from the TeslaCam feed.</div>
       {banner}
+      <div class="card" id="pipeline-card">
+        <div class="pipe-head">
+          <div class="lag-wrap">
+            <div class="lag" id="lag-big" title="Now minus the end of the newest footage analysed. It climbs while the car records the current one-minute clip, then drops once that clip is copied and processed: about -15 s to -100 s while driving. Climbing steadily past that means a backlog is building.">–</div>
+            <div><span style="font-weight:800;">Processing pipeline</span><br>
+              <span class="muted" id="lag-label">behind real time</span>
+              <span class="muted" id="pipeline-headline" style="margin-left:8px;"></span></div>
+          </div>
+          <div class="demo-buttons">
+            <button class="btn" data-demo="realtime" title="Replay the NATIX clips one minute at a time, as the car would deliver them">▶ Real-time demo</button>
+            <button class="btn" data-demo="backlog" title="Drop all NATIX clips in at once and watch the queue drain">⏩ Backlog demo</button>
+            <button class="btn" data-demo="stop" hidden>■ Stop demo</button>
+          </div>
+        </div>
+        <div class="demo-banner" id="demo-banner" hidden></div>
+        <div class="flow">
+          <div class="node" id="n-car"><div class="nh"><span class="dot"></span>Car drive</div>
+            <div class="nv">–</div><div class="ns">–</div></div>
+          <div class="arrow"><span>→</span></div>
+          <div class="node" id="n-ingest"><div class="nh"><span class="dot"></span>Ingest</div>
+            <div class="nv">–</div><div class="ns">–</div></div>
+          <div class="arrow"><span>→</span></div>
+          <div class="node" id="n-queue"><div class="nh"><span class="dot"></span>Queue</div>
+            <div class="nv">–</div><div class="ns">–</div></div>
+          <div class="arrow"><span>→</span></div>
+          <div class="node wide" id="n-proc"><div class="nh"><span class="dot"></span>Processor
+              <span class="muted" id="proc-device" style="margin-left:auto;"></span></div>
+            <div class="states" id="proc-states">
+              <span data-s="idle">Idle</span><span data-s="queued">Waiting</span><span data-s="processing">Processing</span><span data-s="correlating">Correlating</span><span data-s="annotating">Boxing GIFs</span><span data-s="fallback">CPU fallback</span><span data-s="down">Down</span>
+            </div>
+            <div class="ns" id="proc-clip">–</div>
+            <div class="steps" id="proc-steps">
+              <div data-step="detect"><b>Detect</b><small>–</small></div>
+              <div data-step="plates"><b>Plates</b><small>–</small></div>
+              <div data-step="faces"><b>Faces</b><small>–</small></div>
+              <div data-step="saving"><b>Save</b><small>–</small></div>
+            </div>
+            <div class="bar"><div id="proc-bar"></div></div>
+            <div class="ns" id="proc-foot">–</div>
+          </div>
+          <div class="arrow"><span>→</span></div>
+          <div class="outs">
+            <div class="node" id="n-gif"><div class="nh"><span class="dot"></span>GIF worker</div>
+              <div class="ns">–</div></div>
+            <div class="node" id="n-corr"><div class="nh"><span class="dot"></span>Correlation</div>
+              <div class="ns">–</div></div>
+            <div class="node" id="n-alerts"><div class="nh"><span class="dot"></span>Alerts</div>
+              <div class="ns">–</div></div>
+          </div>
+        </div>
+        <div class="pipeline-grid">
+          <div><div class="muted" style="margin-bottom:4px;">Up next (Sentry/Saved first, then newest)</div>
+            <table><tbody id="pipeline-next"><tr><td class="muted">–</td></tr></tbody></table></div>
+          <div><div class="muted" style="margin-bottom:4px;">Just processed</div>
+            <table><tbody id="pipeline-recent"><tr><td class="muted">–</td></tr></tbody></table></div>
+        </div>
+      </div>
       <div class="row" style="margin-bottom:20px;">{stat_tiles}</div>
       {"".join(rows) if rows else '<div class="empty">No alerts yet.</div>'}
       {more_link}
@@ -927,7 +2775,7 @@ def findings_view():
               <div>
                 {severity_pill(finding["severity"])}
                 <span style="font-size:18px; font-weight:800; margin-left:8px;">
-                  <a href="/entity/{esc(finding["entity_type"])}/{esc(finding["entity_id"])}">{esc(finding["entity_label"])}</a>
+                  <a href="{URL_ROOT}/entity/{esc(finding["entity_type"])}/{esc(finding["entity_id"])}">{esc(finding["entity_label"])}</a>
                 </span>
                 <span class="muted"> · {esc(entity_kind)}</span>
               </div>
@@ -974,14 +2822,14 @@ def plates_view():
     cards = []
     for plate in plates:
         image = (
-            f'<img class="evidence" loading="lazy" src="/media/{esc(plate["best_image"])}" style="max-height:96px;" />'
+            f'<img class="evidence" loading="lazy" src="{URL_ROOT}/media/{esc(plate["best_image"])}" style="max-height:96px;" />'
             if plate.get("best_image") else '<div class="muted">no crop saved</div>'
         )
         known_badge = '<span class="pill low">known</span>' if plate["is_known"] else ""
         cards.append(f"""
           <div class="card">
             <div style="margin-bottom:10px;">
-              <a href="/entity/plate/{esc(plate["id"])}"><span class="plate">{esc(plate["plate_text"])}</span></a>
+              <a href="{URL_ROOT}/entity/plate/{esc(plate["id"])}"><span class="plate">{esc(plate["plate_text"])}</span></a>
               {known_badge}
             </div>
             {image}
@@ -1011,7 +2859,7 @@ def faces_view():
     cards = []
     for face in faces:
         image = (
-            f'<img class="evidence" loading="lazy" src="/media/{esc(face["best_image"])}" style="max-height:150px;" />'
+            f'<img class="evidence" loading="lazy" src="{URL_ROOT}/media/{esc(face["best_image"])}" style="max-height:150px;" />'
             if face.get("best_image") else '<div class="muted">no crop saved</div>'
         )
         known_badge = '<span class="pill low">known</span>' if face["is_known"] else ""
@@ -1019,7 +2867,7 @@ def faces_view():
         cards.append(f"""
           <div class="card">
             <div style="font-weight:700; font-size:16px; margin-bottom:8px;">
-              <a href="/entity/face/{esc(face["id"])}">{esc(display_name)}</a> {known_badge}
+              <a href="{URL_ROOT}/entity/face/{esc(face["id"])}">{esc(display_name)}</a> {known_badge}
             </div>
             {image}
             <div class="muted" style="margin-top:10px;">
@@ -1111,7 +2959,7 @@ def entity_view(entity_type: str, entity_id: str):
           <td>{esc(row["camera"] or "-")}</td>
           <td class="mono" style="font-size:12px;">{esc(row["source_file"] or "-")}</td>
           <td>{esc(f'{row["lat"]:.5f}, {row["lon"]:.5f}' if row["lat"] is not None else "no GPS")}</td>
-          <td>{'<img class="evidence" loading="lazy" src="/media/' + esc(row["image"]) + '" style="max-height:52px;" />' if row["image"] else ""}</td>
+          <td>{'<img class="evidence" loading="lazy" src="' + URL_ROOT + '/media/' + esc(row["image"]) + '" style="max-height:52px;" />' if row["image"] else ""}</td>
           {split_cell(row)}
         </tr>
     """ for row in detections)
@@ -1202,7 +3050,7 @@ def entity_view(entity_type: str, entity_id: str):
         let isKnown = {"true" if entity["is_known"] else "false"};
 
         async function post(payload) {{
-          const response = await fetch(`/api/${{ENTITY_TABLE}}/${{ENTITY_ID}}/label`, {{
+          const response = await fetch(`{URL_ROOT}/api/${{ENTITY_TABLE}}/${{ENTITY_ID}}/label`, {{
             method: "POST",
             headers: {{ "Content-Type": "application/json" }},
             body: JSON.stringify(payload),
@@ -1218,21 +3066,21 @@ def entity_view(entity_type: str, entity_id: str):
         }}
         async function mergeInto() {{
           const target = document.getElementById("mergeTarget").value;
-          const response = await fetch(`/api/faces/${{ENTITY_ID}}/merge`, {{
+          const response = await fetch(`{URL_ROOT}/api/faces/${{ENTITY_ID}}/merge`, {{
             method: "POST",
             headers: {{ "Content-Type": "application/json" }},
             body: JSON.stringify({{ into: target }}),
           }});
           const result = await response.json();
-          if (result.ok) location.href = `/entity/face/${{target}}`;
+          if (result.ok) location.href = `{URL_ROOT}/entity/face/${{target}}`;
           else alert("Merge failed: " + (result.error || "unknown error"));
         }}
         async function splitDetection(detectionId) {{
-          const response = await fetch(`/api/faces/detections/${{detectionId}}/split`, {{
+          const response = await fetch(`{URL_ROOT}/api/faces/detections/${{detectionId}}/split`, {{
             method: "POST",
           }});
           const result = await response.json();
-          if (result.ok) location.href = `/entity/face/${{result.new_face_id}}`;
+          if (result.ok) location.href = `{URL_ROOT}/entity/face/${{result.new_face_id}}`;
           else alert("Split failed: " + (result.error || "unknown error"));
         }}
       </script>
@@ -1246,14 +3094,12 @@ def timeline_view():
     Scout's Timeline.vue - drives drawn on a Leaflet map with detections pinned
     where they happened.
 
-    Leaflet loads from a CDN. In a parked car with no signal the map tiles
-    won't render; the rest of the dashboard is unaffected, which is why the map
-    lives on its own page rather than on the front one.
+    Leaflet itself is served from the Orin once scripts/fetch_leaflet.sh has
+    run (the CDN otherwise). The map TILES still come from OpenStreetMap, so in
+    a parked car with no signal the base map stays blank; the tracks and the
+    rest of the dashboard are unaffected.
     """
-    head_extra = """
-      <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-      <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-    """
+    head_extra = leaflet_head(defer=False)
 
     body = """
       <h1>Timeline</h1>
@@ -1266,7 +3112,7 @@ def timeline_view():
           const summary = document.getElementById("summary");
           let data;
           try {
-            data = await (await fetch("/api/map")).json();
+            data = await (await fetch(URL_ROOT + "/api/map")).json();
           } catch (error) {
             summary.innerHTML = '<span class="muted">Could not load map data.</span>';
             return;
@@ -1274,7 +3120,7 @@ def timeline_view():
 
           if (typeof L === "undefined") {
             summary.innerHTML = '<span class="muted">Leaflet could not load (no internet). ' +
-              'Map data is still available at <a href="/api/map">/api/map</a>.</span>';
+              'Map data is still available at <a href="' + URL_ROOT + '/api/map">/api/map</a>.</span>';
             return;
           }
 
@@ -1322,14 +3168,15 @@ def timeline_view():
               const history = document.createElement("a");
               // encodeURIComponent, so an id carrying a slash or a quote
               // cannot climb out of the path it is supposed to be part of.
-              history.href = "/entity/" + encodeURIComponent(kind) + "/" +
+              history.href = URL_ROOT + "/entity/" + encodeURIComponent(kind) + "/" +
                 encodeURIComponent(point.entity_id == null ? "" : point.entity_id);
               history.textContent = "history";
               popup.appendChild(history);
               if (point.image) {
                 popup.appendChild(document.createElement("br"));
                 const evidence = document.createElement("img");
-                evidence.src = "/media/" + encodeURIComponent(point.image);
+                evidence.className = "evidence";
+                evidence.src = URL_ROOT + "/media/" + encodeURIComponent(point.image);
                 evidence.style.maxWidth = "180px";
                 evidence.style.borderRadius = "6px";
                 evidence.style.marginTop = "6px";
@@ -1608,8 +3455,8 @@ def natix_view():
   async function refresh() {
     try {
       const [statusRes, logRes] = await Promise.all([
-        fetch('/api/natix', {cache: 'no-store'}),
-        fetch('/api/natix/logs?lines=400', {cache: 'no-store'})
+        fetch(URL_ROOT + '/api/natix', {cache: 'no-store'}),
+        fetch(URL_ROOT + '/api/natix/logs?lines=400', {cache: 'no-store'})
       ]);
       const status = await statusRes.json();
       const logs = await logRes.json();
@@ -3455,8 +5302,8 @@ def gps_view():
     // growing pile of sockets.
     var abortTimer = setTimeout(function () { controller.abort(); }, intervalMs() * 2);
     Promise.all([
-      fetch("/api/gps", {cache: "no-store", signal: controller.signal}),
-      fetch("/api/gps/logs?lines=400", {cache: "no-store", signal: controller.signal})
+      fetch(URL_ROOT + "/api/gps", {cache: "no-store", signal: controller.signal}),
+      fetch(URL_ROOT + "/api/gps/logs?lines=400", {cache: "no-store", signal: controller.signal})
     ]).then(function (responses) {
       // ok is checked BEFORE .json(). A 401 after a Cloudflare Access session
       // expires returns HTML, and letting .json() throw the parse error would
@@ -3550,23 +5397,24 @@ def gps_view():
 # no-referrer keeps this dashboard's URL out of them, but the tile coordinates
 # are the request. The existing /timeline page already makes that trade; if it
 # ever stops being acceptable, the fix is a local tile cache, not a smaller z.
-def _findmy_map_head() -> str:
+def leaflet_head(defer: bool = True) -> str:
     """
     Load Leaflet locally if it is actually vendored, and from the CDN if not.
 
-    The local paths were the whole story here, and MEDIA_DIR/leaflet does not
-    exist and nothing in this repository creates it - so every request 404ed,
-    `L` was never defined, and the map simply never appeared. Falling back to
-    the same CDN /timeline already uses means the map works out of the box; the
-    source is stamped into the page so the failure message can name what was
+    scripts/fetch_leaflet.sh puts an integrity-checked copy in
+    MEDIA_DIR/leaflet; until it has run, the CDN keeps the maps working. The
+    source is stamped into the page so a failure message can name what was
     tried instead of blaming the network for a missing directory.
+
+    defer=False is for pages whose own inline script needs `L` as soon as it
+    runs (the Timeline).
     """
     vendored_script = MEDIA_DIR / "leaflet" / "leaflet.js"
     vendored_style = MEDIA_DIR / "leaflet" / "leaflet.css"
     if vendored_script.exists() and vendored_style.exists():
         source = "vendored under /media/leaflet"
-        style_href = "/media/leaflet/leaflet.css"
-        script_src = "/media/leaflet/leaflet.js"
+        style_href = f"{URL_ROOT}/media/leaflet/leaflet.css"
+        script_src = f"{URL_ROOT}/media/leaflet/leaflet.js"
     else:
         source = "the unpkg CDN"
         style_href = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
@@ -3575,7 +5423,7 @@ def _findmy_map_head() -> str:
     return f"""
 <link rel="stylesheet" href="{style_href}" />
 <script>window.__leafletSource = "{esc(source)}";</script>
-<script defer src="{script_src}"
+<script {"defer " if defer else ""}src="{script_src}"
         onerror="window.__leafletUnavailable = true;"></script>
 """
 
@@ -3713,7 +5561,7 @@ def findmy_view():
             <span id="findmy-newest-poll">{esc(_format_clock(state.get('newest_poll_ts')) or 'never')}</span> ·
             newest dashcam clip
             <span id="findmy-newest-clip">{esc(_format_clock(state.get('newest_clip_ts')) or 'never')}</span>.
-            <a href="/gps">Receiver detail →</a>
+            <a href="{URL_ROOT}/gps">Receiver detail →</a>
           </div>
           <div class="muted" style="margin-top:6px;" id="findmy-status">
             served {esc(format_timestamp(state.get('server_ts')))}
@@ -4050,7 +5898,7 @@ def findmy_view():
     inFlight = true;
     var controller = new AbortController();
     var abortTimer = setTimeout(function () { controller.abort(); }, intervalMs() * 2);
-    fetch("/api/findmy", {cache: "no-store", signal: controller.signal})
+    fetch(URL_ROOT + "/api/findmy", {cache: "no-store", signal: controller.signal})
       .then(function (response) {
         if (!response.ok) { throw new Error("HTTP " + response.status); }
         return response.json();
@@ -4146,11 +5994,44 @@ def findmy_view():
 </script>
 """
     page = render_page("Find My", body + script, "/findmy",
-                       LOCATION_PAGE_HEAD + _findmy_map_head())
+                       LOCATION_PAGE_HEAD + leaflet_head())
     # See the note in gps_view: a handler that returns a finished Response gets
     # it passed straight through, so the headers have to be set on it here.
     _apply_location_headers(page)
     return page
+
+
+# Building a PlateReader loads the YOLO plate model - 3.5 s on the Orin -
+# and the Settings page only wants its one-line status. Cached per process,
+# refreshed after STAGE_STATUS_TTL_SECONDS, and warmed in the background at
+# startup so even the first visit does not pay for it.
+STAGE_STATUS_TTL_SECONDS = 600
+_stage_status_cache: dict[str, tuple[float, str]] = {}
+
+
+def _load_stage_status(stage: str) -> str:
+    if stage == "alpr":
+        from src.alpr import PlateReader
+        return PlateReader().status_text()
+    from src.faces import FaceEngine
+    return FaceEngine().status_text()
+
+
+def cached_stage_status(stage: str) -> str:
+    cached = _stage_status_cache.get(stage)
+    if cached and time.time() - cached[0] < STAGE_STATUS_TTL_SECONDS:
+        return cached[1]
+    text = _load_stage_status(stage)
+    _stage_status_cache[stage] = (time.time(), text)
+    return text
+
+
+def _warm_stage_status() -> None:
+    for stage in ("alpr", "faces"):
+        try:
+            cached_stage_status(stage)
+        except Exception as error:                       # noqa: BLE001
+            print(f"[⚙️ ui] could not pre-load {stage} status: {error}", flush=True)
 
 
 @app.get("/settings", response_class=HTMLResponse)
@@ -4172,12 +6053,10 @@ def settings_view():
             return f"error: {exception_object}"
 
     def alpr_status():
-        from src.alpr import PlateReader
-        return PlateReader().status_text()
+        return cached_stage_status("alpr")
 
     def face_status():
-        from src.faces import FaceEngine
-        return FaceEngine().status_text()
+        return cached_stage_status("faces")
 
     def tesla_status():
         from src.poller import TeslaFleetClient
@@ -4236,13 +6115,13 @@ def settings_view():
       <div class="card">
         <div style="font-weight:700; margin-bottom:10px;">API</div>
         <div class="muted">
-          <a href="/api/findings">/api/findings</a> ·
-          <a href="/api/plates">/api/plates</a> ·
-          <a href="/api/faces">/api/faces</a> ·
-          <a href="/api/polls">/api/polls</a> ·
-          <a href="/api/drives">/api/drives</a> ·
-          <a href="/api/map">/api/map</a> ·
-          <a href="/alerts">/alerts</a>
+          <a href="{URL_ROOT}/api/findings">/api/findings</a> ·
+          <a href="{URL_ROOT}/api/plates">/api/plates</a> ·
+          <a href="{URL_ROOT}/api/faces">/api/faces</a> ·
+          <a href="{URL_ROOT}/api/polls">/api/polls</a> ·
+          <a href="{URL_ROOT}/api/drives">/api/drives</a> ·
+          <a href="{URL_ROOT}/api/map">/api/map</a> ·
+          <a href="{URL_ROOT}/alerts">/alerts</a>
         </div>
       </div>
     """

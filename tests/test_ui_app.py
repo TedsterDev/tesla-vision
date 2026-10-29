@@ -541,12 +541,26 @@ def test_the_location_pages_are_uncacheable_and_referrer_free():
 # ---------------------------------------------------------------------------
 def test_the_map_is_loaded_from_somewhere_that_exists():
     page = ui_app.findmy_view().body.decode("utf-8")
-    head = ui_app._findmy_map_head()
+    head = ui_app.leaflet_head()
     assert "/media/leaflet/leaflet.js" not in head or (
         (ui_app.MEDIA_DIR / "leaflet" / "leaflet.js").exists()), head
     assert "leaflet.js" in head, head
     assert "__leafletSource" in head, head
     assert "__leafletSource" in page, "the failure message cannot name its source"
+
+
+def test_the_timeline_prefers_the_local_leaflet_and_loads_it_synchronously():
+    leaflet = ui_app.MEDIA_DIR / "leaflet"
+    leaflet.mkdir(parents=True, exist_ok=True)
+    (leaflet / "leaflet.js").write_text("")
+    (leaflet / "leaflet.css").write_text("")
+    try:
+        _, _, page = render("/timeline")
+        assert "/media/leaflet/leaflet.js" in page and "unpkg.com" not in page, page[:400]
+        # Its inline map script needs L at once: no defer.
+        assert "defer src=" not in page.split("leaflet.js")[0].rsplit("<script", 1)[-1] + "leaflet.js"
+    finally:
+        shutil.rmtree(leaflet)
 
 
 def test_going_stale_demotes_the_map_links_and_the_pin():
@@ -562,6 +576,295 @@ def test_the_crash_loop_banner_needs_more_than_one_restart_and_can_clear():
     assert "CRASH_MIN_RESTARTS = 2" in page.replace("CRASH_WINDOW_MS = 300000, ", "")
     assert "identities.shift()" in page, "the window never slides"
     assert "crash.hidden = true" in page, "the banner can never clear"
+
+
+# ---------------------------------------------------------------------------
+# Served under a path prefix (azula.tedebyte.dev/tesla/)
+# ---------------------------------------------------------------------------
+def with_url_root(root):
+    saved = ui_app.URL_ROOT
+    ui_app.URL_ROOT = root
+    return saved
+
+
+def test_prefixed_and_bare_paths_reach_the_same_route():
+    saved = with_url_root("/tesla")
+    try:
+        for path in ("/tesla/healthz", "/healthz", "/tesla/settings", "/settings"):
+            status, _, _ = render(path)
+            assert status == 200, (path, status)
+    finally:
+        ui_app.URL_ROOT = saved
+
+
+def test_the_bare_prefix_redirects_to_its_trailing_slash():
+    saved = with_url_root("/tesla")
+    try:
+        status, headers, _ = render("/tesla")
+        assert status == 308, status
+        assert headers.get("location") == "/tesla/", headers
+        # A segment boundary, not a string prefix: /teslafoo is not ours.
+        status, _, _ = render("/teslafoo")
+        assert status == 404, status
+    finally:
+        ui_app.URL_ROOT = saved
+
+
+def test_the_location_gate_still_sees_a_prefixed_location_route():
+    # The prefix is stripped OUTSIDE the auth middleware. Were it the other way
+    # round, /tesla/findmy would not match LOCATION_ROUTES and would serve.
+    saved_root = with_url_root("/tesla")
+    saved_auth = with_auth_settings("", True, None)
+    try:
+        for path in ("/tesla/gps", "/tesla/findmy", "/tesla/api/gps", "/tesla/api/findmy"):
+            status, _, _ = render(path)
+            assert status == 503, (path, status)
+    finally:
+        restore_auth_settings(saved_auth)
+        ui_app.URL_ROOT = saved_root
+
+
+def test_every_page_link_carries_the_prefix():
+    import re
+    saved = with_url_root("/tesla")
+    try:
+        for path in ("/", "/findings", "/plates", "/faces", "/timeline", "/natix", "/settings"):
+            status, _, body = render("/tesla" + path)
+            assert status == 200, (path, status)
+            assert 'var URL_ROOT = "/tesla";' in body, path
+            # Any root-relative href/src that skipped the prefix. "//" is a
+            # scheme-relative URL to another host, which is not ours to fix.
+            stray = re.findall(r'(?:href|src)="(/(?!/)(?!tesla(?:/|"))[^"]*)"', body)
+            assert not stray, (path, stray[:5])
+    finally:
+        ui_app.URL_ROOT = saved
+
+
+# ---------------------------------------------------------------------------
+# Orin box footer
+# ---------------------------------------------------------------------------
+def test_every_page_carries_the_orin_box_footer():
+    for path in ("/", "/findings", "/plates", "/faces", "/timeline", "/natix", "/settings"):
+        status, _, body = render(path)
+        assert status == 200, (path, status)
+        assert 'id="sysbar"' in body, path
+        assert '/api/system' in body, path
+
+
+def test_the_system_endpoint_reports_the_box_and_not_nonsense():
+    if not Path("/proc/meminfo").is_file():
+        print("  skip  (no /proc here: system stats are read from the Linux kernel)")
+        return
+    status, _, body = render("/api/system")
+    assert status == 200, status
+    stats = json.loads(body)
+    for key in ("mem_used", "mem_total", "disk_used", "disk_total", "cpu_percent"):
+        assert stats[key] is not None, (key, stats)
+    assert 0 < stats["mem_used"] <= stats["mem_total"], stats
+    assert 0 < stats["disk_used"] <= stats["disk_total"], stats
+    assert 0 <= stats["cpu_percent"] <= 100, stats
+
+
+# ---------------------------------------------------------------------------
+# Pipeline status
+# ---------------------------------------------------------------------------
+def test_every_page_carries_the_pipeline_row():
+    status, _, body = render("/plates")
+    assert status == 200, status
+    assert 'id="pipebar"' in body and "/api/pipeline" in body
+
+
+def test_the_recent_page_has_the_queue_card():
+    status, _, body = render("/")
+    assert status == 200, status
+    assert 'id="pipeline-card"' in body and 'id="pipeline-next"' in body
+
+
+def test_no_processor_heartbeat_reads_as_unknown_not_idle():
+    (LOGS_DIR / "processor.json").unlink(missing_ok=True)
+    status, _, body = render("/api/pipeline")
+    assert status == 200, status
+    assert json.loads(body)["state"] == "unknown", body
+
+
+def test_a_silent_idle_processor_reads_as_down():
+    (LOGS_DIR / "processor.json").write_text(json.dumps({
+        "ts": NOW - 600, "current": None, "device": "cuda", "seconds_by_camera": {},
+    }))
+    try:
+        state = json.loads(render("/api/pipeline")[2])["state"]
+        assert state == "down", state
+    finally:
+        (LOGS_DIR / "processor.json").unlink()
+
+
+def test_a_long_clip_reads_as_processing_until_it_is_stuck():
+    from src.common import INBOX_DIR
+    for name in ("2026-02-16_21-31-48-front.mp4", "2026-02-16_21-31-48-back.mp4"):
+        (INBOX_DIR / name).write_bytes(b"")
+    current = {"name": "2026-02-16_21-31-48-front.mp4", "camera": "front",
+               "captured_ts": NOW - 3600}
+    try:
+        # A clip 40 s in with no heartbeat since it began is normal.
+        (LOGS_DIR / "processor.json").write_text(json.dumps({
+            "ts": NOW - 40, "current": dict(current, started_ts=NOW - 40),
+            "seconds_by_camera": {"back": 5.0, "front": 12.0},
+        }))
+        result = json.loads(render("/api/pipeline")[2])
+        assert result["state"] == "processing", result
+        # The clip being processed is not also counted as waiting.
+        assert result["queue"]["depth"] == 1, result["queue"]
+        assert result["eta_seconds"] == 5.0, result["eta_seconds"]
+
+        (LOGS_DIR / "processor.json").write_text(json.dumps({
+            "ts": NOW - 1000, "current": dict(current, started_ts=NOW - 1000),
+            "seconds_by_camera": {},
+        }))
+        assert json.loads(render("/api/pipeline")[2])["state"] == "stuck"
+    finally:
+        (LOGS_DIR / "processor.json").unlink(missing_ok=True)
+        for clip in INBOX_DIR.glob("*.mp4"):
+            clip.unlink()
+
+
+def post_json(path: str, payload, content_type: str = "application/json") -> tuple[int, dict]:
+    body = json.dumps(payload).encode()
+    scope = {
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+        "method": "POST", "scheme": "http", "path": path, "raw_path": path.encode(),
+        "query_string": b"", "root_path": "", "server": ("testserver", 80),
+        "client": ("10.0.0.5", 51234),
+        "headers": [(b"content-type", content_type.encode()),
+                    (b"content-length", str(len(body)).encode())],
+    }
+    messages: list[dict] = []
+    sent = False
+
+    async def receive():
+        nonlocal sent
+        if sent:
+            return {"type": "http.disconnect"}
+        sent = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    async def send(message):
+        messages.append(message)
+
+    asyncio.run(ui_app.app(scope, receive, send))
+    start = next(m for m in messages if m["type"] == "http.response.start")
+    data = b"".join(m.get("body", b"") for m in messages if m["type"] == "http.response.body")
+    return start["status"], json.loads(data or b"{}")
+
+
+def test_the_demo_endpoint_refuses_anything_but_json():
+    status, _ = post_json("/api/demo", {"action": "start", "mode": "realtime"}, "text/plain")
+    assert status == 415, status
+    status, _ = post_json("/api/demo", {"action": "explode"})
+    assert status == 400, status
+    status, _ = post_json("/api/demo", {"action": "start", "mode": "sideways"})
+    assert status == 400, status
+
+
+def test_the_demo_endpoint_leaves_the_processor_a_request():
+    from src.common import BASE_DIR, JOBS_DIR
+    stray = BASE_DIR / "natix-stray" / "x" / "TeslaCam" / "SentryClips" / "2026-02-16_21-31-48"
+    request = JOBS_DIR / "demo.json"
+    try:
+        status, answer = post_json("/api/demo", {"action": "start", "mode": "backlog"})
+        assert status == 409, (status, answer)          # nothing to replay yet
+        stray.mkdir(parents=True)
+        (stray / "2026-02-16_21-31-48-front.mp4").write_bytes(b"")
+        status, answer = post_json("/api/demo", {"action": "start", "mode": "backlog"})
+        assert status == 200 and answer["ok"], (status, answer)
+        assert json.loads(request.read_text())["mode"] == "backlog"
+        status, _ = post_json("/api/demo", {"action": "stop"})
+        assert status == 200 and json.loads(request.read_text())["action"] == "stop"
+    finally:
+        request.unlink(missing_ok=True)
+        shutil.rmtree(BASE_DIR / "natix-stray", ignore_errors=True)
+
+
+def test_the_recent_page_has_the_flow_diagram_and_demo_buttons():
+    status, _, body = render("/")
+    assert status == 200, status
+    for marker in ('id="n-car"', 'id="n-proc"', 'id="proc-steps"', 'id="n-alerts"',
+                   'data-demo="realtime"', 'data-demo="backlog"'):
+        assert marker in body, marker
+
+
+def test_behind_real_time_is_hidden_when_no_footage_is_live():
+    (LOGS_DIR / "processor.json").write_text(json.dumps({
+        "ts": NOW, "current": None, "live_edge_ts": NOW - 86400 * 200,
+    }))
+    (LOGS_DIR / "ingest.json").write_text(json.dumps({"state": "absent", "last_pass_ts": NOW}))
+    try:
+        assert json.loads(render("/api/pipeline")[2])["lag"] == {"mode": "offline", "edge_ts": None}
+        # Recent footage counts as live even before ingest says the car is there.
+        (LOGS_DIR / "processor.json").write_text(json.dumps({
+            "ts": NOW, "current": None, "live_edge_ts": NOW - 70,
+        }))
+        lag = json.loads(render("/api/pipeline")[2])["lag"]
+        assert lag == {"mode": "live", "edge_ts": NOW - 70}, lag
+    finally:
+        (LOGS_DIR / "processor.json").unlink(missing_ok=True)
+        (LOGS_DIR / "ingest.json").unlink(missing_ok=True)
+
+
+def test_a_running_demo_counts_on_its_own_clock():
+    (LOGS_DIR / "processor.json").write_text(json.dumps({
+        "ts": NOW, "current": None, "live_edge_ts": None, "demo_edge_ts": NOW - 30,
+        "demo": {"active": True}, "queue": {"depth": 0, "events": 0, "demo": 0, "next": []},
+    }))
+    try:
+        lag = json.loads(render("/api/pipeline")[2])["lag"]
+        assert lag == {"mode": "demo", "edge_ts": NOW - 30}, lag
+    finally:
+        (LOGS_DIR / "processor.json").unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Activity layer
+# ---------------------------------------------------------------------------
+def test_every_page_carries_the_loading_screen_and_activity_layer():
+    for path in ("/", "/plates", "/timeline", "/settings"):
+        status, _, body = render(path)
+        assert status == 200, (path, status)
+        for marker in ('id="tv-boot"', 'id="tv-bar"', 'id="tv-pill"', "window.fetch = function",
+                       'class="metric tv-loadbadge"', "<noscript><style>#tv-boot"):
+            assert marker in body, (path, marker)
+        # The fetch wrapper must be installed before any page script runs.
+        assert body.index("window.fetch = function") < body.index("<main>"), path
+
+
+def test_every_response_says_how_long_the_orin_took():
+    for path in ("/healthz", "/plates", "/api/system"):
+        _, headers, _ = render(path)
+        timing = headers.get("server-timing", "")
+        assert timing.startswith("app;dur="), (path, headers)
+        assert float(timing.split("dur=")[1].split(";")[0]) >= 0
+
+
+def test_the_settings_page_does_not_reload_the_plate_model_every_visit():
+    calls = []
+    original = ui_app._load_stage_status
+    ui_app._load_stage_status = lambda stage: calls.append(stage) or f"{stage}: ready"
+    ui_app._stage_status_cache.clear()
+    try:
+        for _ in range(3):
+            assert render("/settings")[0] == 200
+        assert sorted(calls) == ["alpr", "faces"], calls
+    finally:
+        ui_app._load_stage_status = original
+        ui_app._stage_status_cache.clear()
+
+
+def test_every_page_carries_the_media_viewer():
+    for path in ("/", "/plates", "/faces", "/timeline"):
+        status, _, body = render(path)
+        assert status == 200, (path, status)
+        for marker in ('id="vw"', 'id="vw-scrub"', 'data-vw="play"', "function decodeGif",
+                       'id="vw-overlay"', 'data-vw="boxes"', 'id="vw-minconf"'):
+            assert marker in body, (path, marker)
 
 
 # ---------------------------------------------------------------------------

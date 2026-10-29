@@ -26,6 +26,9 @@ from src.db import now_ts
 
 NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh")
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
+# For a server with access control (the self-hosted one in docker-compose.yaml
+# is deny-all): a publish token, sent as a Bearer header.
+NTFY_TOKEN = os.environ.get("NTFY_TOKEN", "").strip()
 ALERT_WEBHOOK_URL = os.environ.get("ALERT_WEBHOOK_URL", "").strip()
 PUSHOVER_TOKEN = os.environ.get("PUSHOVER_TOKEN", "").strip()
 PUSHOVER_USER = os.environ.get("PUSHOVER_USER", "").strip()
@@ -70,17 +73,25 @@ def _post(url: str, data: bytes, headers: dict[str, str], timeout: float = 10.0)
 
 
 def _send_ntfy(title: str, message: str, severity: str) -> bool:
-    # ntfy takes the body as the message and metadata as headers.
-    priority = "urgent" if severity == "high" else "default"
-    return _post(
-        f"{NTFY_SERVER}/{NTFY_TOPIC}",
-        message.encode("utf-8"),
-        {
-            "Title": title,
-            "Priority": priority,
-            "Tags": "rotating_light" if severity == "high" else "eyes",
-        },
-    )
+    """
+    Publish as JSON to the server root, not with the title in a header.
+
+    The header form cannot carry the alert titles: they start with "⚠️", and
+    urllib encodes headers as Latin-1, so every send raised inside _post,
+    which swallows exceptions - findings were never delivered and nothing
+    said so. JSON carries UTF-8 in the body.
+    """
+    body = {
+        "topic": NTFY_TOPIC,
+        "title": title,
+        "message": message,
+        "priority": 5 if severity == "high" else 3,
+        "tags": ["rotating_light" if severity == "high" else "eyes"],
+    }
+    headers = {"Content-Type": "application/json"}
+    if NTFY_TOKEN:
+        headers["Authorization"] = f"Bearer {NTFY_TOKEN}"
+    return _post(NTFY_SERVER.rstrip("/"), json.dumps(body).encode("utf-8"), headers)
 
 
 def _send_webhook(title: str, message: str, severity: str, payload: dict) -> bool:
