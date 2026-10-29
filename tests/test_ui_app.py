@@ -652,6 +652,9 @@ def test_every_page_carries_the_orin_box_footer():
 
 
 def test_the_system_endpoint_reports_the_box_and_not_nonsense():
+    if not Path("/proc/meminfo").is_file():
+        print("  skip  (no /proc here: system stats are read from the Linux kernel)")
+        return
     status, _, body = render("/api/system")
     assert status == 200, status
     stats = json.loads(body)
