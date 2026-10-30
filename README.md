@@ -176,6 +176,20 @@ fake vehicle identity the correlation engine then reasons about. So crops below
 a brightness/contrast floor are rejected before OCR, and counted separately —
 "no plates" and "plates too dark to read" are different problems.
 
+**Every sighting keeps the frame it was read from.** An alert's snapshot is the
+frame YOLO scored best, which is rarely the one a plate was read on, so a crop
+alone cannot show where the plate was. Each plate or face sighting therefore
+saves its whole frame beside its crop, as `media/plates/<detection id>-frame.jpg`
+(or `media/faces/...`) with the usual `.boxes.json`. The name comes from the
+detection id, so no column records it. Reading frames are held JPEG-encoded until
+the vote picks a winner: at most `ALPR_MAX_FRAMES + FACE_MAX_FRAMES` per clip,
+and only frames that produced a usable read. The Plates and Faces pages, and each
+identity's sighting history, link every sighting to its frame and to its clip's
+alert snapshot and GIF. They meet on `clip_id`, falling back to the clip
+filename for alerts imported from the legacy JSON. A GIF link appears once the
+worker has written the file. Sightings recorded before this change have no
+frame; re-running the backfill gives them one.
+
 ---
 
 
@@ -848,6 +862,7 @@ python3 tests/test_correlate.py   # scoring scenarios (no deps)
 python3 tests/test_alpr.py        # OCR + voting (needs cv2; skips without tesseract)
 python3 tests/test_faces.py       # identity clustering (needs cv2, numpy)
 python3 tests/test_natix.py       # VX360 mirror: refusal, crash safety, pruning (no deps)
+python3 tests/test_sighting_media.py  # sighting frames + their boxes (needs cv2, ultralytics)
 ```
 
 Or inside the container, where every dependency is present:

@@ -43,6 +43,17 @@ LOGS_DIR = BASE_DIR / "logs"            # optional log files
 PLATE_CROPS_DIR = MEDIA_DIR / "plates"  # cropped license plate JPEGs
 FACE_CROPS_DIR = MEDIA_DIR / "faces"    # cropped face JPEGs
 
+
+def sighting_frame_name(subdirectory: str, detection_id: str) -> str:
+    """
+    The whole frame a plate or face sighting was read from, relative to MEDIA_DIR.
+
+    Named from the detection id rather than stored in a column, so the
+    processor writes it and the dashboard finds it without a schema change.
+    Its boxes sit beside it in the usual `<file>.boxes.json`.
+    """
+    return f"{subdirectory}/{detection_id}-frame.jpg"
+
 # The single SQLite file holding every table (see db.py).
 DB_PATH = env_path("DB_PATH", str(BASE_DIR / "scout.db"))
 

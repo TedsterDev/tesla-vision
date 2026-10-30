@@ -60,7 +60,8 @@ from src.common import (
     BASE_DIR,
     MEDIA_DIR,
     ALERTS_DIR,
-    ensure_dirs
+    ensure_dirs,
+    sighting_frame_name,
 )
 from src.db import connect, import_legacy_alert_json, rows_to_dicts, write_with_retry
 
@@ -483,6 +484,8 @@ PAGE_STYLES = """
                  border-radius:9px; padding:7px 13px; font-size:13px; cursor:pointer;
                  font-family:inherit; }
   button:hover, .btn:hover { border-color:var(--accent); text-decoration:none; }
+  .media-link { display:inline-block; padding:4px 9px; font-size:12px; margin:2px 4px 2px 0;
+                white-space:nowrap; }
   input[type=text] { background:var(--panel-2); border:1px solid var(--line); color:var(--text);
                      border-radius:9px; padding:7px 11px; font-family:inherit; font-size:13px; }
   #map { height:520px; border-radius:14px; border:1px solid var(--line); }
@@ -2814,10 +2817,107 @@ def findings_view():
     return render_page("Findings", body, "/findings")
 
 
+# ---------------------------------------------------------------------------
+# Sighting media: the frame a plate or face was read from, and its clip's alert
+# ---------------------------------------------------------------------------
+
+def _alerts_by_clip(connection) -> tuple[dict[str, Any], dict[str, Any]]:
+    """
+    Every alert's snapshot and GIF, by clip id and by clip filename.
+
+    A sighting and its alert come from the same clip, so they meet on clip_id.
+    Alerts imported from the legacy JSON files have no clip_id, so the clip's
+    filename is the fallback. Read once per page rather than per sighting:
+    alerts has no index on either column.
+    """
+    by_id: dict[str, Any] = {}
+    by_file: dict[str, Any] = {}
+    for alert in connection.execute(
+        "SELECT clip_id, source_file, jpeg, gif FROM alerts ORDER BY timestamp"
+    ).fetchall():
+        if alert["clip_id"]:
+            by_id[alert["clip_id"]] = alert
+        if alert["source_file"]:
+            by_file[alert["source_file"]] = alert
+    return by_id, by_file
+
+
+def _sighting_media(row, folder: str, alerts: tuple[dict[str, Any], dict[str, Any]]) -> dict[str, str]:
+    """
+    What can be shown for one sighting: its frame, and its alert's snapshot and GIF.
+
+    Only files that exist are offered. Sightings from before frames were saved
+    have none; a clip that never raised an alert has no snapshot; a GIF is
+    queued after the alert and only appears once the worker has written it.
+    """
+    media: dict[str, str] = {}
+    frame = sighting_frame_name(folder, row["id"])
+    if (MEDIA_DIR / frame).is_file():
+        media["frame"] = frame
+    by_id, by_file = alerts
+    alert = by_id.get(row["clip_id"]) or by_file.get(row["source_file"])
+    if alert:
+        for kind, column in (("snapshot", "jpeg"), ("gif", "gif")):
+            if alert[column] and (MEDIA_DIR / alert[column]).is_file():
+                media[kind] = alert[column]
+    return media
+
+
+SIGHTING_MEDIA_LINKS = (
+    ("frame", "🎯 frame", "the frame this was read from, with its box"),
+    ("snapshot", "📷 snapshot", "the alert snapshot from this clip"),
+    ("gif", "🎞️ GIF", "the alert GIF from this clip"),
+)
+
+
+def _media_links(media: dict[str, str]) -> str:
+    """Links that open a sighting's media in the page's viewer."""
+    return " ".join(
+        f'<a class="btn media-link" href="{URL_ROOT}/media/{esc(media[kind])}" target="_blank" '
+        f'data-viewer="1" title="{esc(title)}">{label}</a>'
+        for kind, label, title in SIGHTING_MEDIA_LINKS if kind in media
+    )
+
+
+def _latest_media_by_entity(table: str, entity_column: str, folder: str) -> dict[str, dict[str, str]]:
+    """
+    Each identity's most recent sighting that has something to show.
+
+    Newest first, stopping at the first sighting with media, so an identity's
+    card links to its latest frame, snapshot or GIF.
+    """
+    connection = get_connection()
+    try:
+        alerts = _alerts_by_clip(connection)
+        rows = connection.execute(
+            f"SELECT id, {entity_column} AS entity_id, clip_id, source_file FROM {table} "
+            "ORDER BY ts DESC"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    latest: dict[str, dict[str, str]] = {}
+    for row in rows:
+        if row["entity_id"] in latest:
+            continue
+        media = _sighting_media(row, folder, alerts)
+        if media:
+            latest[row["entity_id"]] = media
+    return latest
+
+
+def _latest_media_block(media: dict[str, str] | None) -> str:
+    if not media:
+        return ""
+    return (f'<div style="margin-top:10px;"><div class="muted" style="margin-bottom:4px;">'
+            f'latest sighting</div>{_media_links(media)}</div>')
+
+
 @app.get("/plates", response_class=HTMLResponse)
 def plates_view():
     """Scout's AllPlates.vue."""
     plates = api_plates()
+    latest_media = _latest_media_by_entity("plate_detections", "plate_id", "plates")
 
     cards = []
     for plate in plates:
@@ -2839,6 +2939,7 @@ def plates_view():
               last {esc(format_timestamp(plate["last_seen_ts"]))}
             </div>
             <div style="margin-top:8px;">threat {esc(plate["threat_score"])}/100</div>
+            {_latest_media_block(latest_media.get(plate["id"]))}
           </div>
         """)
 
@@ -2855,6 +2956,7 @@ def plates_view():
 def faces_view():
     """Scout's AllFaces.vue, including its 'Stranger #N' naming."""
     faces = api_faces()
+    latest_media = _latest_media_by_entity("face_detections", "face_id", "faces")
 
     cards = []
     for face in faces:
@@ -2876,6 +2978,7 @@ def faces_view():
               last {esc(format_timestamp(face["last_seen_ts"]))}
             </div>
             <div style="margin-top:8px;">threat {esc(face["threat_score"])}/100</div>
+            {_latest_media_block(latest_media.get(face["id"]))}
           </div>
         """)
 
@@ -2912,7 +3015,7 @@ def entity_view(entity_type: str, entity_id: str):
                 (entity_id,),
             ).fetchone()
             detections = connection.execute(
-                "SELECT id, ts, source_file, camera, frame_number, det_confidence, "
+                "SELECT id, ts, clip_id, source_file, camera, frame_number, det_confidence, "
                 "match_distance, image, lat, lon, drive_id FROM face_detections "
                 "WHERE face_id=? ORDER BY ts DESC",
                 (entity_id,),
@@ -2926,6 +3029,7 @@ def entity_view(entity_type: str, entity_id: str):
             "SELECT * FROM correlations WHERE entity_type=? AND entity_id=?",
             (entity_type, entity_id),
         ).fetchone()
+        alerts = _alerts_by_clip(connection)
     finally:
         connection.close()
 
@@ -2960,6 +3064,7 @@ def entity_view(entity_type: str, entity_id: str):
           <td class="mono" style="font-size:12px;">{esc(row["source_file"] or "-")}</td>
           <td>{esc(f'{row["lat"]:.5f}, {row["lon"]:.5f}' if row["lat"] is not None else "no GPS")}</td>
           <td>{'<img class="evidence" loading="lazy" src="' + URL_ROOT + '/media/' + esc(row["image"]) + '" style="max-height:52px;" />' if row["image"] else ""}</td>
+          <td>{_media_links(_sighting_media(row, entity_type + "s", alerts)) or '<span class="muted">none saved</span>'}</td>
           {split_cell(row)}
         </tr>
     """ for row in detections)
@@ -3039,7 +3144,7 @@ def entity_view(entity_type: str, entity_id: str):
       <div class="card">
         <div style="font-weight:700; margin-bottom:10px;">Sighting history ({len(detections)})</div>
         <table>
-          <tr><th>when</th><th>camera</th><th>clip</th><th>location</th><th>evidence</th>{split_header}</tr>
+          <tr><th>when</th><th>camera</th><th>clip</th><th>location</th><th>evidence</th><th>media</th>{split_header}</tr>
           {detection_rows}
         </table>
       </div>

@@ -868,6 +868,156 @@ def test_every_page_carries_the_media_viewer():
 
 
 # ---------------------------------------------------------------------------
+# Plates and Faces link each sighting to its frame, snapshot and GIF
+# ---------------------------------------------------------------------------
+def seed_sightings():
+    """
+    One plate seen three times and one person seen once:
+
+    - pdet-new (newest): a clip with no alert and no saved frame - nothing to show
+    - pdet-mid: its own frame, and an alert matched on clip_id whose GIF is
+      still queued, so no GIF file yet
+    - pdet-old: no frame; an alert from the legacy JSON with no clip_id,
+      matched on the clip's filename, snapshot and GIF both on disk
+    - fdet-1: a face with its frame and nothing else
+    - alert-bare: an unrelated alert with no filename or media
+    """
+    from src.common import MEDIA_DIR
+    connection = ui_app.get_connection()
+    try:
+        for table in ("plate_detections", "plates", "face_detections", "faces", "alerts"):
+            connection.execute(f"DELETE FROM {table}")
+        connection.execute(
+            "INSERT INTO plates (id, plate_text, first_seen_ts, last_seen_ts, detection_count) "
+            "VALUES ('plate01', 'TEST123', ?, ?, 3)", (NOW - 300, NOW - 100))
+        for detection_id, ts, clip_id, source_file in (
+            ("pdet-new", NOW - 100, "clip-new", "new-front.mp4"),
+            ("pdet-mid", NOW - 200, "clip-mid", "mid-front.mp4"),
+            ("pdet-old", NOW - 300, "clip-old", "old-front.mp4"),
+        ):
+            connection.execute(
+                "INSERT INTO plate_detections (id, plate_id, plate_text, ts, clip_id, source_file, camera) "
+                "VALUES (?, 'plate01', 'TEST123', ?, ?, ?, 'front')", (detection_id, ts, clip_id, source_file))
+        connection.execute(
+            "INSERT INTO faces (id, person_name, first_seen_ts, last_seen_ts, detection_count) "
+            "VALUES ('face01', 'Stranger #1', ?, ?, 1)", (NOW - 50, NOW - 50))
+        connection.execute(
+            "INSERT INTO face_detections (id, face_id, ts, clip_id, source_file, camera) "
+            "VALUES ('fdet-1', 'face01', ?, 'clip-face', 'face-front.mp4', 'front')", (NOW - 50,))
+        connection.execute(
+            "INSERT INTO alerts (id, timestamp, source_file, clip_id, jpeg, gif, status) "
+            "VALUES ('alert-mid', ?, 'mid-front.mp4', 'clip-mid', 'alert-mid.jpg', 'alert-mid.gif', 'gif_queued')",
+            (NOW - 200,))
+        connection.execute(
+            "INSERT INTO alerts (id, timestamp, source_file, clip_id, jpeg, gif, status) "
+            "VALUES ('alert-old', ?, 'old-front.mp4', NULL, 'alert-old.jpg', 'alert-old.gif', 'gif_done')",
+            (NOW - 300,))
+        # An alert row with no filename at all must not trip the lookup.
+        connection.execute(
+            "INSERT INTO alerts (id, timestamp, source_file, clip_id, jpeg, gif, status) "
+            "VALUES ('alert-bare', ?, NULL, 'clip-unrelated', NULL, NULL, 'gif_queued')", (NOW - 400,))
+        connection.commit()
+    finally:
+        connection.close()
+    for name in ("plates/pdet-mid-frame.jpg", "faces/fdet-1-frame.jpg",
+                 "alert-mid.jpg", "alert-old.jpg", "alert-old.gif"):
+        (MEDIA_DIR / name).parent.mkdir(parents=True, exist_ok=True)
+        (MEDIA_DIR / name).write_bytes(b"x")
+
+
+def clear_sightings():
+    connection = ui_app.get_connection()
+    try:
+        for table in ("plate_detections", "plates", "face_detections", "faces", "alerts"):
+            connection.execute(f"DELETE FROM {table}")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def sighting_rows(body: str) -> dict[str, str]:
+    """Each sighting row of an entity page, keyed by its clip filename."""
+    rows = {}
+    for chunk in body.split("<tr>")[2:]:
+        for name in ("new-front.mp4", "mid-front.mp4", "old-front.mp4", "face-front.mp4"):
+            if name in chunk:
+                rows[name] = chunk.split("</tr>")[0]
+    return rows
+
+
+def test_each_plate_sighting_links_to_exactly_the_media_that_exists():
+    seed_sightings()
+    try:
+        status, _, body = render("/entity/plate/plate01")
+    finally:
+        clear_sightings()
+    assert status == 200, status
+    rows = sighting_rows(body)
+    assert set(rows) == {"new-front.mp4", "mid-front.mp4", "old-front.mp4"}, rows.keys()
+    # Nothing saved: said in words, not left as an empty cell.
+    assert "none saved" in rows["new-front.mp4"] and "/media/" not in rows["new-front.mp4"]
+    # Matched on clip_id; the queued GIF is not offered until it exists.
+    assert "/media/plates/pdet-mid-frame.jpg" in rows["mid-front.mp4"]
+    assert "/media/alert-mid.jpg" in rows["mid-front.mp4"]
+    assert "alert-mid.gif" not in rows["mid-front.mp4"]
+    # Matched on the filename when the alert has no clip_id; no frame saved.
+    assert "/media/alert-old.jpg" in rows["old-front.mp4"] and "/media/alert-old.gif" in rows["old-front.mp4"]
+    assert "-frame.jpg" not in rows["old-front.mp4"]
+
+
+def test_sighting_links_open_in_the_viewer_and_say_what_they_are():
+    seed_sightings()
+    try:
+        _, _, body = render("/entity/plate/plate01")
+    finally:
+        clear_sightings()
+    row = sighting_rows(body)["old-front.mp4"]
+    assert row.count('data-viewer="1"') == 2, row
+    for label in ("📷 snapshot", "🎞️ GIF"):
+        assert label in row, (label, row)
+    assert "🎯 frame" in sighting_rows(body)["mid-front.mp4"]
+    assert "<th>media</th>" in body
+
+
+def test_the_plates_page_links_each_plate_to_its_latest_sighting_with_media():
+    seed_sightings()
+    try:
+        status, _, body = render("/plates")
+    finally:
+        clear_sightings()
+    assert status == 200, status
+    # The newest sighting has nothing, so the card falls back to the one before.
+    assert "latest sighting" in body
+    assert "/media/plates/pdet-mid-frame.jpg" in body and "/media/alert-mid.jpg" in body
+    assert "alert-old" not in body
+
+
+def test_the_faces_pages_link_sightings_to_their_frames():
+    seed_sightings()
+    try:
+        _, _, faces_body = render("/faces")
+        _, _, entity_body = render("/entity/face/face01")
+    finally:
+        clear_sightings()
+    assert "/media/faces/fdet-1-frame.jpg" in faces_body
+    row = sighting_rows(entity_body)["face-front.mp4"]
+    assert "/media/faces/fdet-1-frame.jpg" in row and "snapshot" not in row, row
+    assert "not this person" in row
+
+
+def test_an_identity_with_no_sighting_media_gets_no_media_block():
+    seed_sightings()
+    try:
+        from src.common import MEDIA_DIR
+        for name in ("plates/pdet-mid-frame.jpg", "alert-mid.jpg", "alert-old.jpg", "alert-old.gif"):
+            (MEDIA_DIR / name).unlink()
+        _, _, body = render("/plates")
+    finally:
+        clear_sightings()
+    assert "TEST123" in body and "latest sighting" not in body
+
+
+# ---------------------------------------------------------------------------
 def main() -> int:
     tests = [
         value for name, value in sorted(globals().items())
