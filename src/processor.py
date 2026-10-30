@@ -55,6 +55,7 @@ from src.common import (
     ALERTS_DIR,
     MEDIA_DIR,
     PLATE_CROPS_DIR,
+    sighting_frame_name,
 )
 from src.clipmeta import detect_clip_source, describe_clip, parse_clip_filename
 from src.clipqueue import CLIP_SECONDS, discard_source, estimate_seconds, queue_entries, read_source, summarize
@@ -285,6 +286,12 @@ class ClipAnalysis:
         # Every detection on the snapshot frame, for the viewer's boxes.
         self.best_frame_number: int | None = None
         self.best_boxes: list[dict] = []
+        # Each frame a plate or face was read from, JPEG-encoded, with that
+        # frame's boxes, by frame number: (jpeg bytes, boxes). The vote picks
+        # its winner only after the last frame, so every reading frame is
+        # kept until then - encoded, a few hundred KB each and at most
+        # ALPR_MAX_FRAMES + FACE_MAX_FRAMES of them, not ~4 MB raw.
+        self.sighting_frames: dict[int, tuple[bytes, list[dict]]] = {}
         # For the dashboard's progress display.
         self.plate_frames = 0
         self.face_frames = 0
@@ -305,10 +312,11 @@ def analyze_clip(model: YOLO, video_path: Path, plate_reader=None, face_engine=N
     """
     Run every enabled detector over one clip in a single pass.
 
-    Returns a ClipAnalysis. Frames are never accumulated in memory beyond the
-    single best snapshot - a 10-second 1280x960 clip at 3fps would otherwise
-    hold ~110MB of raw frames, which on a 7.4GB box shared with three model
-    runtimes is not a trade worth making.
+    Returns a ClipAnalysis. Raw frames are never accumulated in memory beyond
+    the single best snapshot - a 10-second 1280x960 clip at 3fps would
+    otherwise hold ~110MB of raw frames, which on a 7.4GB box shared with three
+    model runtimes is not a trade worth making. The frames a plate or face was
+    read from are kept too, but JPEG-encoded and only those (sighting_frames).
 
     `progress(stage, analysis)`, if given, is called after each step so the
     dashboard can show where a clip is: "detect" after each sampled frame,
@@ -386,16 +394,21 @@ def analyze_clip(model: YOLO, video_path: Path, plate_reader=None, face_engine=N
             analysis.best_frame_number = frame_number
             analysis.best_boxes = boxes_this_frame
 
+        # Plate and face boxes on this frame, and whether either stage read
+        # something a sighting can be recorded from.
+        extra_boxes: list[dict] = []
+        read_something = False
+
         # --- ALPR, budgeted, only where there is a vehicle to read ---------
         if (vehicle_boxes_full_res and alpr_budget > 0
                 and frame_number - last_alpr_frame >= EXPENSIVE_STAGE_FRAME_GAP):
             plates_here = plate_reader.read_plates(frame, vehicle_boxes_full_res, frame_number)
             analysis.plate_candidates.extend(plates_here)
-            if became_best:
-                for plate in plates_here:
-                    analysis.best_boxes.append(normalised_box(
-                        "plate", f"plate {plate.text}" if plate.text else "plate",
-                        plate.ocr_confidence or plate.det_confidence, plate.bbox, width, height))
+            for plate in plates_here:
+                extra_boxes.append(normalised_box(
+                    "plate", f"plate {plate.text}" if plate.text else "plate",
+                    plate.ocr_confidence or plate.det_confidence, plate.bbox, width, height))
+                read_something = True
             alpr_budget -= 1
             last_alpr_frame = frame_number
             analysis.plate_frames += 1
@@ -405,18 +418,26 @@ def analyze_clip(model: YOLO, video_path: Path, plate_reader=None, face_engine=N
         if (saw_person and face_budget > 0
                 and frame_number - last_face_frame >= EXPENSIVE_STAGE_FRAME_GAP):
             for face_detection in face_engine.detect(frame, frame_number):
-                if became_best:
-                    analysis.best_boxes.append(normalised_box(
-                        "face", "face", face_detection.confidence, face_detection.bbox, width, height))
+                extra_boxes.append(normalised_box(
+                    "face", "face", face_detection.confidence, face_detection.bbox, width, height))
                 embedding = face_engine.embed(frame, face_detection)
                 if embedding is not None:
                     x, y, w, h = face_detection.bbox
                     crop = frame[max(0, y):y + h, max(0, x):x + w].copy()
                     analysis.face_observations.append((face_detection, embedding, crop))
+                    read_something = True
             face_budget -= 1
             last_face_frame = frame_number
             analysis.face_frames += 1
             report("faces", analysis)
+
+        # When this frame became the snapshot, best_boxes is this same list,
+        # so the snapshot gets the plate and face boxes too.
+        boxes_this_frame.extend(extra_boxes)
+        if read_something:
+            encoded_ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+            if encoded_ok:
+                analysis.sighting_frames[frame_number] = (encoded.tobytes(), boxes_this_frame)
 
     return analysis
 
@@ -587,21 +608,45 @@ def save_crop(frame, directory: Path, detection_id: str, subdirectory: str) -> s
     return f"{subdirectory}/{out.name}"
 
 
+def save_sighting_frame(analysis: ClipAnalysis, frame_number: int, detection_id: str,
+                        subdirectory: str) -> str | None:
+    """
+    Save the whole frame a sighting was read from, with its boxes.
+
+    A crop alone does not say where the plate or face was, and the alert's
+    snapshot is whichever frame scored best for YOLO - usually not the one the
+    plate was read on. Returns the name relative to MEDIA_DIR, or None when
+    the frame was not kept.
+    """
+    sighting = analysis.sighting_frames.get(frame_number)
+    if sighting is None:
+        return None
+    jpeg_bytes, boxes = sighting
+    name = sighting_frame_name(subdirectory, detection_id)
+    out = MEDIA_DIR / name
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(jpeg_bytes)
+    write_boxes(out, "snapshot", [boxes])
+    return name
+
+
 def discard_crop(crop_name: str | None) -> None:
     """
-    Delete a crop we saved but could not attach to a database row.
+    Delete a crop (or sighting frame) we saved but could not attach to a row.
 
     The crop has to be written before the INSERT, because the row stores its
     filename - which means any failure between the two leaves a file on disk
     that nothing will ever reference or clean up. On a device recording
-    continuously that is a slow, silent disk leak. Cheap insurance.
+    continuously that is a slow, silent disk leak. Cheap insurance. A frame's
+    boxes file goes with it.
     """
     if not crop_name:
         return
-    try:
-        (MEDIA_DIR / crop_name).unlink(missing_ok=True)
-    except OSError:
-        pass
+    for leftover in (crop_name, crop_name + ".boxes.json"):
+        try:
+            (MEDIA_DIR / leftover).unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def enqueue_gif(src_video: Path, alert_id: str):
@@ -652,6 +697,7 @@ def record_plate_detections(connection, analysis: ClipAnalysis, context: dict) -
 
     detection_id = uuid.uuid4().hex[:12]
     crop_name = save_crop(winner.crop, PLATE_CROPS_DIR, detection_id, "plates")
+    frame_name = save_sighting_frame(analysis, winner.frame_number, detection_id, "plates")
     seen_ts = context["ts"]
 
     if plate_id is None:
@@ -696,6 +742,7 @@ def record_plate_detections(connection, analysis: ClipAnalysis, context: dict) -
         # No row means nothing will ever reference this crop again.
         connection.rollback()
         discard_crop(crop_name)
+        discard_crop(frame_name)
         raise
 
     return winner.text
@@ -731,6 +778,7 @@ def record_face_detections(connection, face_engine, analysis: ClipAnalysis, cont
         crop_name = save_crop(
             crops_by_id.get(id(face_detection)), FACE_CROPS_DIR, detection_id, "faces"
         )
+        save_sighting_frame(analysis, face_detection.frame_number, detection_id, "faces")
 
         upsert(connection, "face_detections", {
             "id": detection_id,
