@@ -1,0 +1,28 @@
+[Unit]
+Description=Car storage - the car records into an image on a USB drive; minute snapshots feed the inbox
+Documentation=file:/home/tedster/projects/tesla-alerts/README.md
+After=local-fs.target sys-kernel-config.mount
+Wants=sys-kernel-config.mount
+
+[Service]
+Type=simple
+# Root, and deliberately not sandboxed like ingest.service: this mounts the
+# backing store and every snapshot, attaches loop devices, writes the USB
+# gadget in configfs and - only when the Storage page asks, and after its own
+# checks - formats a drive. ProtectSystem/PrivateTmp would hide or break each
+# of those.
+User=root
+WorkingDirectory=/home/tedster/projects/tesla-alerts
+EnvironmentFile=-/home/tedster/projects/tesla-alerts/.env
+Environment=PYTHONPATH=/home/tedster/projects/tesla-alerts
+Environment=BASE_DIR=/mnt/jetsondata/tesla-alerts
+# btrfs for the backing store, libcomposite for the gadget, loop for snapshots.
+ExecStartPre=/sbin/modprobe -a btrfs libcomposite loop
+ExecStart=/usr/bin/python3 -u /home/tedster/projects/tesla-alerts/src/carstore.py
+
+Restart=always
+RestartSec=10
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

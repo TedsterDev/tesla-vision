@@ -584,6 +584,7 @@ NAV_TABS = [
     ("/natix", "NATIX"),
     ("/findmy", "Find My"),
     ("/gps", "GPS"),
+    ("/storage", "Storage"),
     ("/settings", "Settings"),
 ]
 
@@ -2815,6 +2816,289 @@ def findings_view():
       {"".join(cards) if cards else '<div class="empty">Nothing has scored yet. Findings appear once an entity is seen on more than one occasion.</div>'}
     """
     return render_page("Findings", body, "/findings")
+
+
+# ---------------------------------------------------------------------------
+# Car storage: the drive the car records to (src/carstore.py does the work on
+# the host; this page only shows its heartbeat and passes it requests)
+# ---------------------------------------------------------------------------
+CARSTORE_STALE_SECONDS = 30
+GB_BYTES = 1000 ** 3
+
+
+def storage_status() -> dict[str, Any]:
+    """carstore.json, plus whether the service behind it is alive."""
+    from src.common import LOGS_DIR
+    beat = _read_json(LOGS_DIR / "carstore.json")
+    if beat is None:
+        return {"service": "missing"}
+    age = int(time.time() - (beat.get("written_ts") or 0))
+    beat["service"] = "stale" if age > CARSTORE_STALE_SECONDS else "running"
+    beat["age_seconds"] = age
+    return beat
+
+
+def _gb(size: Any) -> str:
+    return f"{(_as_int(size) or 0) / GB_BYTES:.0f} GB"
+
+
+def _storage_summary(status: dict[str, Any]) -> str:
+    """The sentences at the top of the page: is the car recording somewhere we can read?"""
+    service = status.get("service")
+    if service == "missing":
+        return ('<div class="reason alarm">The car storage service is not running on the Jetson, so the car '
+                'is not recording anywhere the Jetson can read. Install it once with '
+                '<code>sudo ./scripts/install_carstore.sh</code> in the tesla-vision checkout.</div>')
+    lines = []
+    if service == "stale":
+        lines.append(f'<div class="reason alarm">The car storage service last reported '
+                     f'{esc(_relative_age(status.get("age_seconds")))} ago - it may have stopped.</div>')
+    state = status.get("state")
+    if state == "no_storage":
+        lines.append('<div class="reason">No car storage drive yet. Format a USB drive below and the car '
+                     'records to it; footage then reaches the Jetson about a minute after it is recorded.</div>')
+    elif state == "error":
+        lines.append(f'<div class="reason alarm">Car storage error: {esc(status.get("reason"))}</div>')
+    backing = status.get("backing") or {}
+    export = status.get("export") or {}
+    snap = status.get("snapshot") or {}
+    if state == "exporting" and backing:
+        car = ("The car is connected and has the drive." if export.get("car_connected")
+               else "The car is not connected right now (or is asleep).")
+        lines.append(f'<div class="reason">Recording to a {esc(_gb(backing.get("image_bytes")))} image on '
+                     f'{esc(backing.get("device"))} ({esc(_gb(backing.get("free_bytes")))} free). {car}</div>')
+        if backing.get("below_tesla_minimum"):
+            lines.append(f'<div class="reason alarm">The image is smaller than Tesla\'s '
+                         f'{esc(status.get("settings", {}).get("tesla_min_image_gb", 64))} GB minimum - the car '
+                         'may refuse it. Use a larger drive.</div>')
+    if snap.get("last_ts"):
+        ago = _relative_age(time.time() - snap["last_ts"])
+        if snap.get("error"):
+            lines.append(f'<div class="reason alarm">Last snapshot, {esc(ago)} ago, failed: '
+                         f'{esc(snap["error"])}</div>')
+        else:
+            text = (f'Last snapshot {esc(ago)} ago took {esc(snap.get("seconds"))} s and picked up '
+                    f'{esc(snap.get("copied_last", 0))} new clip(s); {esc(snap.get("copied_total", 0))} '
+                    'since the service started.')
+            if snap.get("newest_clip_ts"):
+                text += (f' Newest clip received was recorded '
+                         f'{esc(_relative_age(time.time() - snap["newest_clip_ts"]))} ago.')
+            lines.append(f'<div class="reason">{text}</div>')
+        if snap.get("copying"):
+            lines.append(f'<div class="reason">Copying now: {esc(snap["copying"])} clip(s) so far '
+                         'this snapshot.</div>')
+        if snap.get("deferred"):
+            lines.append('<div class="reason">More finished clips are waiting; they follow over the next '
+                         'snapshots, newest first.</div>')
+        if snap.get("paused"):
+            lines.append(f'<div class="reason alarm">Copying paused: {esc(snap["paused"])}.</div>')
+    return "".join(lines)
+
+
+def _storage_job(status: dict[str, Any]) -> str:
+    job = status.get("job")
+    if not job:
+        return ""
+    target = job.get("partition") or "the drive"
+    state = job.get("state")
+    if state == "running":
+        text, css = f'Formatting {esc(target)}: {esc(job.get("step"))}…', "reason"
+    elif state == "done":
+        text, css = f'Done: {esc(job.get("message"))}', "reason"
+    else:
+        text, css = f'Not formatted: {esc(job.get("message"))}', "reason alarm"
+    return f'<div class="card"><div style="font-weight:700; margin-bottom:6px;">Last format request</div>' \
+           f'<div class="{css}">{text}</div></div>'
+
+
+def _format_button(drive: dict[str, Any], partition: dict[str, Any] | None, label: str) -> str:
+    """A button that opens the confirm dialog, carrying the exact words of what gets erased."""
+    if partition is None:
+        names = ", ".join(f'{p["path"]} ({p.get("label") or p.get("fstype") or "unformatted"})'
+                          for p in drive.get("partitions") or []) or "nothing readable"
+        erases = (f'Every partition on {drive["path"]} ({drive.get("model")}, {_gb(drive.get("size_bytes"))}) '
+                  f'is erased: {names}.')
+    else:
+        erases = (f'{partition["path"]} ({partition.get("label") or "no label"}, '
+                  f'{partition.get("fstype") or "unformatted"}, {_gb(partition.get("size_bytes"))}) is erased. '
+                  'Other partitions on the drive are not touched.')
+        if partition.get("label") == "TESLACAM":
+            if partition.get("fstype") in ("vfat", "ext4", "ext3", "ext2"):
+                erases += ' Clips on it that were never processed are copied to the Jetson first.'
+            else:
+                erases += (f' It is {partition.get("fstype") or "unformatted"}, which the Jetson cannot read, '
+                           'so its clips cannot be copied off first.')
+    if drive.get("role") == "car storage":
+        erases += " This drive is the car's storage now: its recordings are erased too."
+    size = partition["size_bytes"] if partition else drive.get("size_bytes")
+    if (_as_int(size) or 0) < 64 * GB_BYTES:
+        erases += " It is smaller than Tesla's 64 GB minimum, so the car may refuse it."
+    return (f'<button class="btn" data-format-drive="{esc(drive["id"])}" '
+            f'data-format-partition="{esc(partition["path"] if partition else "")}" '
+            f'data-format-erases="{esc(erases)}">{esc(label)}</button>')
+
+
+def _storage_drives(status: dict[str, Any]) -> str:
+    drives = status.get("drives") or []
+    if not drives:
+        return ('<div class="empty">No USB drives attached to the Jetson. Plug one into a USB-A port; '
+                'it appears here within a few seconds.</div>')
+    rows = []
+    for drive in drives:
+        parts = "<br/>".join(
+            f'{esc(p["path"])}: {esc(p.get("label") or "no label")}, {esc(p.get("fstype") or "unformatted")}, '
+            f'{esc(_gb(p.get("size_bytes")))}' + (f', mounted at {esc(p["mountpoint"])}' if p.get("mountpoint") else "")
+            for p in drive.get("partitions") or []) or '<span class="muted">no partitions</span>'
+        if drive.get("blocked"):
+            actions = f'<span class="muted">Not offered: {esc(drive["blocked"])}</span>'
+        else:
+            buttons = [_format_button(drive, None, "Format whole drive as car storage")]
+            buttons += [_format_button(drive, p, f'Format {p["path"]} only')
+                        for p in drive.get("partitions") or [] if p.get("label") != "teslacam-backing"]
+            actions = " ".join(buttons)
+        rows.append(f"""
+          <tr>
+            <td>{esc(drive.get("model"))}<br/><span class="muted">{esc(drive["path"])}, {esc(_gb(drive.get("size_bytes")))}</span></td>
+            <td>{esc(drive.get("role"))}</td>
+            <td style="font-size:12px;">{parts}</td>
+            <td>{actions}</td>
+          </tr>""")
+    return ('<table><tr><th>drive</th><th>role</th><th>partitions</th><th>actions</th></tr>'
+            + "".join(rows) + "</table>")
+
+
+def storage_fragment(status: dict[str, Any] | None = None) -> str:
+    """Everything on the page that changes: refreshed in place every few seconds."""
+    status = storage_status() if status is None else status
+    return f"""
+      <div id="storage-live" data-nonce="{esc(status.get("nonce") or "")}">
+        <div class="card">{_storage_summary(status)}</div>
+        {_storage_job(status)}
+        <div class="card">
+          <div style="font-weight:700; margin-bottom:10px;">USB drives on the Jetson</div>
+          {_storage_drives(status) if status.get("service") != "missing" else
+           '<div class="muted">Drives are listed by the car storage service, which is not running.</div>'}
+        </div>
+      </div>"""
+
+
+@app.get("/api/storage")
+def api_storage():
+    return storage_status()
+
+
+@app.get("/storage/live", response_class=HTMLResponse)
+def storage_live():
+    return HTMLResponse(storage_fragment())
+
+
+@app.post("/api/storage/format")
+async def api_storage_format(request: Request):
+    """
+    Ask carstore.py to format a drive as car storage. It re-checks everything
+    itself; this only refuses what is plainly wrong and leaves it the request.
+
+    JSON only, like /api/demo: a cross-site form cannot send it without a
+    CORS preflight this app never answers.
+    """
+    from src.common import JOBS_DIR
+    if "application/json" not in (request.headers.get("content-type") or ""):
+        return JSONResponse({"ok": False, "error": "expected application/json"}, status_code=415)
+    try:
+        body = await request.json()
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        return JSONResponse({"ok": False, "error": "expected a JSON object"}, status_code=400)
+    drive_id, partition = body.get("drive_id"), body.get("partition") or None
+    if not (isinstance(drive_id, str) and len(drive_id) == 12 and all(c in "0123456789abcdef" for c in drive_id)):
+        return JSONResponse({"ok": False, "error": "unknown drive"}, status_code=400)
+    if partition is not None and not (isinstance(partition, str) and partition.startswith("/dev/")):
+        return JSONResponse({"ok": False, "error": "unknown partition"}, status_code=400)
+    if body.get("confirm") != "ERASE":
+        return JSONResponse({"ok": False, "error": "type ERASE to confirm"}, status_code=400)
+    status = storage_status()
+    if status.get("service") != "running":
+        return JSONResponse({"ok": False, "error": "the car storage service is not running"}, status_code=409)
+    if (status.get("job") or {}).get("state") == "running":
+        return JSONResponse({"ok": False, "error": "a format is already running"}, status_code=409)
+    JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    temporary = JOBS_DIR / ".carstore-request.json.tmp"
+    temporary.write_text(json.dumps({
+        "action": "format", "drive_id": drive_id, "partition": partition, "confirm": "ERASE",
+        "nonce": str(body.get("nonce") or ""), "ts": int(time.time()),
+    }), encoding="utf-8")
+    os.replace(temporary, JOBS_DIR / "carstore-request.json")
+    return {"ok": True}
+
+
+STORAGE_SCRIPT = """
+<dialog id="fmt" style="max-width:520px; background:var(--panel); color:var(--text);
+        border:1px solid var(--line); border-radius:14px; padding:20px;">
+  <div style="font-weight:800; font-size:17px; margin-bottom:10px;">Format as car storage?</div>
+  <div id="fmt-erases" class="reason alarm" style="margin-bottom:12px;"></div>
+  <div class="muted" style="margin-bottom:12px;">The drive becomes the car's recording drive: the Jetson
+    creates the car's image on it and offers it to the car. This cannot be undone.</div>
+  <label for="fmt-confirm">Type <b>ERASE</b> to confirm:</label>
+  <input type="text" id="fmt-confirm" autocomplete="off" style="display:block; margin:8px 0 14px;" />
+  <div class="row">
+    <button id="fmt-go" disabled>Erase and format</button>
+    <button id="fmt-cancel">Cancel</button>
+  </div>
+  <div id="fmt-msg" class="muted" style="margin-top:10px;"></div>
+</dialog>
+<script>
+(() => {
+  const dialog = document.getElementById("fmt"), confirmBox = document.getElementById("fmt-confirm");
+  const go = document.getElementById("fmt-go"), msg = document.getElementById("fmt-msg");
+  let target = null;
+  document.addEventListener("click", (event) => {
+    const button = event.target.closest && event.target.closest("[data-format-drive]");
+    if (!button) return;
+    target = {drive_id: button.dataset.formatDrive, partition: button.dataset.formatPartition || null,
+              nonce: document.getElementById("storage-live").dataset.nonce};
+    document.getElementById("fmt-erases").textContent = button.dataset.formatErases;
+    confirmBox.value = ""; go.disabled = true; msg.textContent = "";
+    dialog.showModal();
+  });
+  confirmBox.addEventListener("input", () => { go.disabled = confirmBox.value.trim() !== "ERASE"; });
+  document.getElementById("fmt-cancel").addEventListener("click", () => dialog.close());
+  go.addEventListener("click", async () => {
+    go.disabled = true; msg.textContent = "Sending…";
+    try {
+      const response = await fetch(URL_ROOT + "/api/storage/format", {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(Object.assign({confirm: confirmBox.value.trim()}, target)),
+      });
+      const answer = await response.json();
+      if (answer.ok) { dialog.close(); refresh(); }
+      else { msg.textContent = "Not sent: " + answer.error; go.disabled = false; }
+    } catch (error) { msg.textContent = "Not sent: " + error; go.disabled = false; }
+  });
+  async function refresh() {
+    if (dialog.open) return;
+    try {
+      const response = await fetch(URL_ROOT + "/storage/live", {cache: "no-store", tvQuiet: true});
+      if (response.ok) document.getElementById("storage-live").outerHTML = await response.text();
+    } catch (error) { /* keep the last view */ }
+  }
+  setInterval(refresh, 5000);
+})();
+</script>
+"""
+
+
+@app.get("/storage", response_class=HTMLResponse)
+def storage_view():
+    body = f"""
+      <h1>Car storage</h1>
+      <div class="sub">The car records into an image on a USB drive attached to the Jetson. Every minute the
+        Jetson takes a snapshot of it and picks up the clips the car has finished, so footage reaches the
+        pipeline about a minute after it is recorded - and the car keeps recording the whole time.</div>
+      {storage_fragment()}
+      {STORAGE_SCRIPT}
+    """
+    return render_page("Storage", body, "/storage")
 
 
 # ---------------------------------------------------------------------------

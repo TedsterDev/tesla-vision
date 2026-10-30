@@ -85,10 +85,14 @@ def iterate_new_clips(root: Path):
         yield mp4file
 
 
-def safe_copy_to_inbox(src: Path, inbox: Path = INBOX_DIR) -> Path | None:
+def safe_copy_to_inbox(src: Path, inbox: Path = INBOX_DIR, require_stable: bool = True) -> Path | None:
     """
     Copy a Tesla-written file into the inbox once its size has stopped
     changing. Returns the inbox path, or None if it was skipped.
+
+    require_stable=False skips the size-stability wait, for sources that
+    cannot change underneath us - carstore.py reads a frozen snapshot, where
+    waiting eight seconds per clip would only delay real time.
 
     Written to a dotfile first and renamed into place: a rename within one
     filesystem is atomic, so the processor can never pick up a half-copied
@@ -97,7 +101,7 @@ def safe_copy_to_inbox(src: Path, inbox: Path = INBOX_DIR) -> Path | None:
     """
     if src.name.startswith("."):
         return None
-    if not file_is_stable(src):
+    if require_stable and not file_is_stable(src):
         return None
 
     dest = inbox / src.name

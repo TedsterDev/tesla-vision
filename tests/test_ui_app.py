@@ -727,8 +727,9 @@ def test_a_long_clip_reads_as_processing_until_it_is_stuck():
             clip.unlink()
 
 
-def post_json(path: str, payload, content_type: str = "application/json") -> tuple[int, dict]:
-    body = json.dumps(payload).encode()
+def post_json(path: str, payload, content_type: str = "application/json",
+              raw: bytes | None = None) -> tuple[int, dict]:
+    body = raw if raw is not None else json.dumps(payload).encode()
     scope = {
         "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
         "method": "POST", "scheme": "http", "path": path, "raw_path": path.encode(),
@@ -1015,6 +1016,182 @@ def test_an_identity_with_no_sighting_media_gets_no_media_block():
     finally:
         clear_sightings()
     assert "TEST123" in body and "latest sighting" not in body
+
+
+# ---------------------------------------------------------------------------
+# Storage: the drive the car records to
+# ---------------------------------------------------------------------------
+GB = 1000 ** 3
+CARSTORE_JSON = LOGS_DIR / "carstore.json"
+
+
+def write_carstore(**fields) -> dict:
+    status = {"schema": 1, "written_ts": int(time.time()), "state": "no_storage", "nonce": "abc123",
+              "drives": [], "backing": None, "export": None, "job": None,
+              "snapshot": {"last_ts": None}, "settings": {"tesla_min_image_gb": 64}}
+    status.update(fields)
+    CARSTORE_JSON.write_text(json.dumps(status), encoding="utf-8")
+    return status
+
+
+def drive(path, size_gb, partitions, role="available", blocked=None, drive_id="0123456789ab"):
+    return {"id": drive_id, "path": path, "model": "SanDisk Extreme", "size_bytes": size_gb * GB,
+            "role": role, "blocked": blocked,
+            "partitions": [{"path": p[0], "label": p[1], "fstype": p[2], "size_bytes": p[3] * GB,
+                            "mountpoint": p[4] if len(p) > 4 else None} for p in partitions]}
+
+
+def storage_page() -> str:
+    status, _, body = render("/storage")
+    assert status == 200, status
+    return body
+
+
+def test_the_storage_page_says_when_the_service_is_not_installed():
+    CARSTORE_JSON.unlink(missing_ok=True)
+    body = storage_page()
+    assert "not running on the Jetson" in body and "install_carstore.sh" in body
+    assert "Drives are listed by the car storage service" in body
+    assert 'href="/storage"' in body, "Storage is in the nav"
+
+
+def test_each_format_button_says_exactly_what_it_erases():
+    write_carstore(drives=[
+        drive("/dev/sdb", 250, [("/dev/sdb1", "TESLACAM", "vfat", 120), ("/dev/sdb2", "jetsondata", "ext4", 130)],
+              role="old TESLACAM drive"),
+        drive("/dev/sda", 35, [("/dev/sda1", "VX360", "exfat", 35)], role="NATIX stick",
+              blocked="this is the NATIX VX360 stick", drive_id="1111111111aa"),
+        drive("/dev/sdc", 32, [("/dev/sdc1", "TESLACAM", "exfat", 32)], drive_id="2222222222bb"),
+        drive("/dev/sdd", 128, [("/dev/sdd1", "teslacam-backing", "btrfs", 128, "/backingfiles")],
+              role="car storage", drive_id="3333333333cc"),
+        drive("/dev/sde", 64, [], drive_id="4444444444dd"),
+    ])
+    try:
+        body = storage_page()
+    finally:
+        CARSTORE_JSON.unlink(missing_ok=True)
+    assert "No car storage drive yet" in body
+    assert "Format whole drive as car storage" in body and "Format /dev/sdb1 only" in body
+    assert "Clips on it that were never processed are copied to the Jetson first." in body
+    assert "Other partitions on the drive are not touched." in body
+    assert "exfat, which the Jetson cannot read, so its clips cannot be copied off first" in body
+    assert "smaller than Tesla&#x27;s 64 GB minimum" in body or "smaller than Tesla's 64 GB minimum" in body
+    assert "Not offered: this is the NATIX VX360 stick" in body
+    assert 'data-format-drive="1111111111aa"' not in body
+    assert "its recordings are erased too" in body
+    assert "Format /dev/sdd1 only" not in body, "the backing partition is reformatted only as a whole drive"
+    assert "mounted at /backingfiles" in body and "no partitions" in body
+    assert 'data-nonce="abc123"' in body and 'id="fmt-confirm"' in body
+
+
+def test_an_exporting_store_says_whether_the_car_has_it_and_how_far_behind_it_is():
+    now = int(time.time())
+    write_carstore(state="exporting",
+                   backing={"device": "/dev/sdd1", "image_bytes": 60 * GB, "free_bytes": 50 * GB,
+                            "below_tesla_minimum": True},
+                   export={"car_connected": False},
+                   snapshot={"last_ts": now - 30, "seconds": 2.5, "copied_last": 2, "copied_total": 9,
+                             "newest_clip_ts": now - 80, "paused": "less than 5 GB free on the Jetson"})
+    try:
+        body = storage_page()
+        write_carstore(state="exporting", backing={"device": "/dev/sdd1", "image_bytes": 120 * GB,
+                                                   "free_bytes": 5 * GB},
+                       export={"car_connected": True},
+                       snapshot={"last_ts": now - 10, "error": "cp --reflink failed (1): No space left"})
+        connected = storage_page()
+    finally:
+        CARSTORE_JSON.unlink(missing_ok=True)
+    assert "Recording to a 60 GB image on /dev/sdd1 (50 GB free)" in body
+    assert "not connected right now" in body
+    assert "smaller than Tesla" in body
+    assert "picked up 2 new clip(s); 9 since the service started" in body
+    assert "Newest clip received was recorded 80 seconds ago" in body
+    assert "Copying paused: less than 5 GB free on the Jetson" in body
+    assert "The car is connected and has the drive." in connected
+    assert "failed: cp --reflink failed (1): No space left" in connected
+    write_carstore(state="exporting", snapshot={"last_ts": int(time.time()) - 5, "seconds": 1.0,
+                                                "copied_last": 0, "copied_total": 0, "copying": 7,
+                                                "deferred": True})
+    try:
+        first = storage_page()
+    finally:
+        CARSTORE_JSON.unlink(missing_ok=True)
+    assert "picked up 0 new clip(s)" in first and "Newest clip received" not in first
+    assert "Copying now: 7 clip(s) so far" in first
+    assert "More finished clips are waiting; they follow over the next snapshots, newest first." in first
+
+
+def test_a_stopped_or_failing_service_is_never_shown_as_fine():
+    write_carstore(state="error", reason="no USB device controller (UDC)")
+    data = json.loads(CARSTORE_JSON.read_text())
+    data["written_ts"] = int(time.time()) - 600
+    CARSTORE_JSON.write_text(json.dumps(data))
+    try:
+        body = storage_page()
+        api = ui_app.api_storage()
+    finally:
+        CARSTORE_JSON.unlink(missing_ok=True)
+    assert "last reported 10 minutes ago - it may have stopped" in body
+    assert "Car storage error: no USB device controller (UDC)" in body
+    assert api["service"] == "stale" and api["age_seconds"] >= 600
+
+
+def test_the_last_format_request_is_reported_in_words():
+    sentences = {}
+    for state, extra in (("running", {"step": "erasing /dev/sdb1"}),
+                         ("done", {"message": "formatted /dev/sdb1 as car storage; old clips: 4 copied"}),
+                         ("refused", {"message": "the drive list changed since the page loaded"})):
+        write_carstore(job={"state": state, "partition": "/dev/sdb1", **extra})
+        sentences[state] = storage_page()
+    CARSTORE_JSON.unlink(missing_ok=True)
+    assert "Formatting /dev/sdb1: erasing /dev/sdb1" in sentences["running"]
+    assert "Done: formatted /dev/sdb1 as car storage; old clips: 4 copied" in sentences["done"]
+    assert "Not formatted: the drive list changed" in sentences["refused"]
+
+
+def test_no_drives_says_where_to_plug_one_in_and_the_page_refreshes_in_place():
+    write_carstore()
+    try:
+        body = storage_page()
+        status, _, live = render("/storage/live")
+    finally:
+        CARSTORE_JSON.unlink(missing_ok=True)
+    assert "No USB drives attached to the Jetson. Plug one into a USB-A port" in body
+    assert status == 200 and live.strip().startswith('<div id="storage-live" data-nonce="abc123"')
+    assert "<html" not in live
+
+
+def test_the_format_endpoint_refuses_everything_but_a_confirmed_json_request():
+    from src.common import JOBS_DIR
+    request_path = JOBS_DIR / "carstore-request.json"
+    request_path.unlink(missing_ok=True)
+    good = {"drive_id": "0123456789ab", "partition": "/dev/sdb1", "confirm": "ERASE", "nonce": "abc123"}
+    CARSTORE_JSON.unlink(missing_ok=True)
+    cases = [
+        (post_json("/api/storage/format", good, content_type="text/plain"), 415, "application/json"),
+        (post_json("/api/storage/format", None, raw=b"{nope"), 400, "JSON object"),
+        (post_json("/api/storage/format", ["x"]), 400, "JSON object"),
+        (post_json("/api/storage/format", {**good, "drive_id": "../../etc"}), 400, "unknown drive"),
+        (post_json("/api/storage/format", {**good, "partition": "sdb1"}), 400, "unknown partition"),
+        (post_json("/api/storage/format", {**good, "confirm": "yes"}), 400, "ERASE"),
+        (post_json("/api/storage/format", good), 409, "not running"),
+    ]
+    write_carstore(job={"state": "running"})
+    cases.append((post_json("/api/storage/format", good), 409, "already running"))
+    for (status, answer), expected_status, expected_text in cases:
+        assert status == expected_status and expected_text in answer["error"], (status, answer)
+    assert not request_path.exists(), "nothing refused may reach the host service"
+
+    write_carstore()
+    try:
+        status, answer = post_json("/api/storage/format", {**good, "partition": None})
+        written = json.loads(request_path.read_text())
+    finally:
+        CARSTORE_JSON.unlink(missing_ok=True)
+        request_path.unlink(missing_ok=True)
+    assert status == 200 and answer == {"ok": True}
+    assert written["action"] == "format" and written["partition"] is None and written["nonce"] == "abc123"
+    assert written["confirm"] == "ERASE" and abs(written["ts"] - time.time()) < 5
 
 
 # ---------------------------------------------------------------------------
