@@ -775,6 +775,67 @@ which recomputes every `clips.captured_ts` and `alerts.timestamp` from the
 filename, and is idempotent: a row that is already right recomputes to the
 same number.
 
+## Real-time footage: carstore.service
+
+`ingest.service` above can only copy while the car does **not** have the
+drive, so footage arrived only when someone stopped the export by hand. Car
+storage removes that trade, the way teslausb does
+(`github.com/marcone/teslausb`, `run/make_snapshot.sh`):
+
+- The car records into an **image file**, `cam_disk.img`, on a btrfs
+  filesystem on a USB drive attached to the Jetson. The USB gadget offers that
+  file to the car, which sees an ordinary FAT32 stick with a `TeslaCam` folder.
+- Every minute `src/carstore.py` copies the image with
+  `cp --reflink=always`. On btrfs that copy shares every block with the
+  original, so it is near-instant and nearly free, and the car keeps recording
+  throughout.
+- The copy is ours: it is repaired (`fsck.vfat -a`), mounted read-only, and
+  every finished clip not already in the pipeline goes to `inbox/`, newest
+  first. A clip counts as finished once its MP4 boxes tile the file and include
+  a `moov`, and it is not the newest of its camera (or is over two minutes
+  old). RecentClips older than `CARSTORE_MAX_AGE_HOURS` are skipped.
+
+Footage reaches the pipeline about a minute after it is recorded. Whether
+processing then keeps up is the processor's `realtime_factor` on the Recent
+page.
+
+**Why btrfs, FAT32, and a separate drive.** teslausb uses XFS; this kernel
+(5.15-tegra) has neither XFS nor dm-snapshot, but has btrfs, which supports
+reflink copies the same way. The kernel cannot mount exFAT, so the image is
+FAT32, which Tesla accepts (service.tesla.com: exFAT, MS-DOS FAT, ext3 or ext4;
+at least 64 GB; at least 4 MB/s sustained writes). The OS card has too little
+room for a 64 GB image plus the pipeline, hence a USB drive.
+
+**Formatting a drive.** The dashboard's **Storage** page lists every USB drive
+and offers *Format whole drive as car storage* or *Format partition only*. The
+OS card is never listed and the NATIX stick is listed but never offered. The
+confirm dialog says exactly what is erased and needs `ERASE` typed. The page
+only leaves a request in `jobs/`; `carstore.py`, on the host, re-checks
+everything against the drives as they are at that moment before it touches
+anything. Formatting a `TESLACAM` partition first copies its never-processed
+clips into the inbox when it can be read (FAT or ext*; not exFAT).
+
+Do not use the car's own *Format USB Device* on this drive: it reformats the
+image as exFAT, which the Jetson cannot read. The Storage page says so if it
+happens; format it again from there.
+
+**Installing it** (once, as root, on the Jetson):
+
+```
+sudo ./scripts/install_carstore.sh
+```
+
+It installs `btrfs-progs` if needed, loads btrfs at boot, makes the old
+`/mnt/teslacam` and `/mnt/jetsondata` fstab entries `noauto`, and starts the
+service. Run it **before** plugging the old TESLACAM drive back in: otherwise
+its `jetsondata` partition is mounted over `/mnt/jetsondata` at the next boot,
+hiding the live data on the card behind the old drive's.
+
+**Disk space.** Live footage adds roughly 10 GB per hour of driving, so the
+processor prunes `processed/` oldest-first above `PROCESSED_KEEP_GB` (20) or
+when the disk has less than `PROCESSED_MIN_FREE_GB` (5) free, and carstore
+stops copying below `CARSTORE_MIN_FREE_GB`. Alerts keep their snapshot and GIF.
+
 ## Verifying the pipeline actually works
 
 A zero result and a silently broken pipeline look **identical** from the dashboard.
@@ -863,6 +924,8 @@ python3 tests/test_alpr.py        # OCR + voting (needs cv2; skips without tesse
 python3 tests/test_faces.py       # identity clustering (needs cv2, numpy)
 python3 tests/test_natix.py       # VX360 mirror: refusal, crash safety, pruning (no deps)
 python3 tests/test_sighting_media.py  # sighting frames + their boxes (needs cv2, ultralytics)
+python3 tests/test_carstore.py    # car storage: drives, formatting, snapshots (no deps)
+python3 tests/test_processor_retention.py  # processed/ pruning (needs cv2, ultralytics)
 ```
 
 Or inside the container, where every dependency is present:

@@ -144,6 +144,13 @@ GIF_FPS = env_int("GIF_FPS", 8)
 # on the CPU for this long before trying the GPU again.
 GPU_RETRY_SECONDS = env_int("GPU_RETRY_SECONDS", 300)
 
+# processed/ keeps finished clips for the GIF worker, the box annotator, the
+# NATIX mirror and backfills. With live footage it grows ~10 GB per hour of
+# driving, so the oldest go once it passes PROCESSED_KEEP_GB or the disk
+# drops below PROCESSED_MIN_FREE_GB. Alerts keep their snapshot and GIF.
+PROCESSED_KEEP_GB = env_int("PROCESSED_KEEP_GB", 20)
+PROCESSED_MIN_FREE_GB = env_int("PROCESSED_MIN_FREE_GB", 5)
+
 # The general-purpose COCO detector that finds people and vehicles. Staged in
 # MODELS_DIR by scripts/fetch_models.sh so it is present offline.
 COCO_MODEL_FILENAME = "yolo26n.pt"
@@ -1358,7 +1365,40 @@ def process_clip(connection, detectors: Detectors, mp4filefrominbox: Path,
     dest = PROCESSED_DIR / mp4filefrominbox.name
     mp4filefrominbox.rename(dest)
     discard_source(mp4filefrominbox)
+    pruned = prune_processed()
+    if pruned:
+        print(f"[⚙️ processor] pruned {pruned} oldest processed clip(s) to keep disk space", flush=True)
     return alerted, device
+
+
+def prune_processed(directory: Path = PROCESSED_DIR, keep_bytes: int | None = None,
+                    min_free_bytes: int | None = None, free_bytes=None) -> int:
+    """
+    Delete the oldest processed clips while processed/ holds more than
+    keep_bytes or the disk has less than min_free_bytes free. Oldest by
+    modification time, which ingest preserves from the car - so by when the
+    footage was recorded. Returns how many were deleted.
+    """
+    keep_bytes = PROCESSED_KEEP_GB * 1000 ** 3 if keep_bytes is None else keep_bytes
+    min_free_bytes = PROCESSED_MIN_FREE_GB * 1000 ** 3 if min_free_bytes is None else min_free_bytes
+    free_bytes = free_bytes or (lambda: shutil.disk_usage(directory).free)
+    sized = []
+    for clip in directory.glob("*.mp4"):
+        try:
+            stat = clip.stat()
+        except OSError:
+            continue
+        sized.append((stat.st_mtime, stat.st_size, clip))
+    sized.sort(key=lambda entry: entry[0])
+    total = sum(size for _, size, _ in sized)
+    removed = 0
+    for _, size, clip in sized:
+        if total <= keep_bytes and free_bytes() >= min_free_bytes:
+            break
+        clip.unlink(missing_ok=True)
+        total -= size
+        removed += 1
+    return removed
 
 
 def run_correlation(connection) -> int:
