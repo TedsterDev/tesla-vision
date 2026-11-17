@@ -79,7 +79,7 @@ services:
   # because Docker cannot bind the tailnet address before tailscaled is up;
   # without credentials the port answers nothing useful.
   ntfy:
-    image: binwiederhier/ntfy:v2.11.0
+    image: binwiederhier/ntfy:v2.38.1
     command: ["serve"]
     ports:
       - "8090:80"
