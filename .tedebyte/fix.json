@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "image": "python:3.10-bookworm",
+  "jobs": {
+    "test": { "script": "scripts/fix/test.sh", "timeoutMin": 25 }
+  }
+}
