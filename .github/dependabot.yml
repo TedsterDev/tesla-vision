@@ -1,0 +1,30 @@
+# Dependabot for tesla-vision: security updates only, one grouped pull request
+# per ecosystem, which tedebyte-admin's security-fix pipeline tests and merges
+# on the owner's passkey (merge-only mode, FLEET-528; jetson-setup's push
+# scripts then put the change on the car).
+#
+# open-pull-requests-limit: 0 turns version updates off for an ecosystem;
+# security updates are unaffected and keep GitHub's own limit of open pull
+# requests. The weekly schedule is required by the file format and only
+# matters for version updates.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    groups:
+      pip-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    groups:
+      actions-security:
+        applies-to: security-updates
+        patterns: ["*"]

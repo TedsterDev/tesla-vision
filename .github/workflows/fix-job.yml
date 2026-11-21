@@ -1,0 +1,232 @@
+# From tedebyte-admin's templates/security-fixes/fix-job.yml, for a merge-only
+# repository (FLEET-528): admin runs only the fix pipeline's test job here.
+# There is no Fly app, testing environment, deploy or rollback, so the
+# template's app names, flyctl, gate key and token steps are left out, and the
+# run never reads a secret. Keep name, run-name, the input names and the job
+# ids (plan, run) as they are: admin reads them.
+name: Fix job
+# Admin finds the run it started by this exact title: the kind, the commit and
+# its request id. Never change it without changing admin.
+run-name: Fix ${{ inputs.kind }} ${{ inputs.sha }} (${{ inputs.request }})
+
+# Runs the test job of .tedebyte/fix.json on a GitHub-hosted runner: the
+# script it names, inside the image it names, at the commit `sha`. Admin starts
+# it when it runs the job here rather than on the Jetson or a one-shot Fly
+# machine; the script behaves the same in all three. Admin dispatches it on the
+# pull request's branch (on main when the pull request changes a workflow
+# file, so this file is never one the pull request wrote).
+#
+# fix.json is at the commit and a pull request can edit it, so the plan job
+# checks it the way admin does before anything from the commit runs.
+on:
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: "Job to run: test (the only job a merge-only repository has)"
+        required: true
+        type: string
+      sha:
+        description: "Commit to run it on (the full 40-character SHA)"
+        required: true
+        type: string
+      request:
+        description: "Request id (letters, digits, - and _), shown in the run name"
+        required: true
+        type: string
+      image:
+        description: "Rollback only, so always empty here."
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Checks the inputs and the commit's fix.json, and works out what the run job
+  # runs. Nothing from the commit runs here.
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      image: ${{ steps.read.outputs.image }}
+      script: ${{ steps.read.outputs.script }}
+      timeout: ${{ steps.read.outputs.timeout }}
+      job_timeout: ${{ steps.read.outputs.job_timeout }}
+      postgres: ${{ steps.read.outputs.postgres }}
+    env:
+      KIND: ${{ inputs.kind }}
+      SHA: ${{ inputs.sha }}
+      REQUEST: ${{ inputs.request }}
+      IMAGE: ${{ inputs.image }}
+    steps:
+      - name: Check the inputs
+        # bash's =~ matches the whole value, so one with a line break never
+        # passes (grep would check each line on its own).
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          KIND_RE='^(test|testing|smoke|deploy|rollback)$'
+          SHA_RE='^[0-9a-f]{40}$'
+          REQUEST_RE='^[A-Za-z0-9_-]{1,64}$'
+          [[ $KIND =~ $KIND_RE ]] || fail "kind must be test, testing, smoke, deploy or rollback"
+          [ "$KIND" = test ] || fail "this repository is merge-only: only the test job runs here, never $KIND"
+          [[ $SHA =~ $SHA_RE ]] || fail "sha must be a full 40-character commit SHA"
+          [[ $REQUEST =~ $REQUEST_RE ]] || fail "request must be 1-64 letters, digits, - or _"
+          [ -z "$IMAGE" ] || fail "image is for rollback only; leave it empty for $KIND"
+          echo "$KIND $SHA (request $REQUEST)"
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.sha }}
+          # No token left in .git/config: the run job mounts the checkout into
+          # the image.
+          persist-credentials: false
+
+      - name: Read .tedebyte/fix.json
+        id: read
+        # The rules admin checks (schema version 1). Names from the file are
+        # printed JSON-quoted, so a key with a line break cannot write a
+        # workflow command into the log.
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          f=.tedebyte/fix.json
+          { [ -f "$f" ] && [ ! -L "$f" ]; } || fail "$f is missing"
+          jq empty "$f" 2>/dev/null || fail "$f is not valid JSON"
+          problems=$(jq -r --arg kind "$KIND" '
+            def names: map(tojson) | join(", ");
+            def only(allowed): (keys - allowed) as $extra
+              | if ($extra | length) > 0 then "unknown key(s) " + ($extra | names) else empty end;
+            def whole_in(lo; hi): type == "number" and . == floor and . >= lo and . <= hi;
+            def jobs: ["test", "testing", "smoke", "deploy", "rollback"];
+            if type != "object" then "must be a JSON object"
+            else
+              (only(["version", "image", "services", "jobs"]) | "top level: " + .),
+              (if .version == 1 then empty else "version must be 1" end),
+              (if (.image | type) == "string"
+                  and (.image | test("\\A(node|python|golang|php|ghcr\\.io/astral-sh/uv|mcr\\.microsoft\\.com/playwright):[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\\z"))
+                  and (.image | endswith(":latest") | not)
+               then empty
+               else "image must be node:, python:, golang:, php:, ghcr.io/astral-sh/uv: or mcr.microsoft.com/playwright: with an explicit tag other than latest"
+               end),
+              (if has("services") | not then empty
+               elif (.services | type) == "array" and (.services | all(. == "postgres:16")) then empty
+               else "services may list only postgres:16"
+               end),
+              (if (.jobs | type) != "object" then "jobs must be an object"
+               else
+                 (.jobs | only(jobs) | "jobs: " + .),
+                 (if .jobs | has($kind) then empty else "jobs.\($kind) is not declared" end),
+                 (.jobs | to_entries[] | select(.key | IN(jobs[])) | .key as $k | .value
+                   | if type != "object" then "jobs.\($k) must be an object"
+                     else
+                       (only(["script", "timeoutMin"]) | "jobs.\($k): " + .),
+                       (if (.script | type) == "string"
+                           and (.script | split("/")
+                                | length >= 3 and .[0] == "scripts" and .[1] == "fix"
+                                  and all(.[]; . != "." and . != ".." and test("\\A[A-Za-z0-9._-]+\\z")))
+                        then empty
+                        else "jobs.\($k).script must be a relative path under scripts/fix/ (letters, digits, ., _ and -; no ..)"
+                        end),
+                       (if .timeoutMin | whole_in(1; 30) then empty
+                        else "jobs.\($k).timeoutMin must be a whole number from 1 to 30"
+                        end)
+                     end)
+               end)
+            end
+          ' "$f")
+          if [ -n "$problems" ]; then
+            while IFS= read -r p; do echo "::error::$f: $p"; done <<<"$problems"
+            exit 1
+          fi
+          image=$(jq -r .image "$f")
+          script=$(jq -r --arg kind "$KIND" '.jobs[$kind].script' "$f")
+          timeout=$(jq -r --arg kind "$KIND" '.jobs[$kind].timeoutMin | floor' "$f")
+          postgres=$(jq -r '(.services // []) | any(. == "postgres:16")' "$f")
+          { [ -f "$script" ] && [ ! -L "$script" ]; } || fail "$script (jobs.$KIND.script) is not a file in the repository"
+          {
+            echo "image=$image"
+            echo "script=$script"
+            echo "timeout=$timeout"
+            # The run job's own limit: the script's plus ten minutes for the
+            # checkout and the image pull. Expressions have no arithmetic, so
+            # the sum is worked out here.
+            echo "job_timeout=$((timeout + 10))"
+            echo "postgres=$postgres"
+          } >> "$GITHUB_OUTPUT"
+          echo "$KIND: bash $script in $image, at most $timeout minutes, Postgres $postgres"
+
+  # Runs the script inside the image, with exactly the environment the
+  # contract gives the test kind (tedebyte-admin templates/security-fixes/
+  # README.md, "Joining the pipeline"): no token and no secret.
+  run:
+    name: run
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(needs.plan.outputs.job_timeout) }}
+    # Postgres 16 only when fix.json declares it. GitHub's workflow syntax
+    # reference, jobs.<job_id>.services.<service_id>.image: "If
+    # jobs.<job_id>.services.<service_id>.image is assigned an empty string,
+    # the service will not start."
+    # https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_idservicesservice_idimage
+    services:
+      postgres:
+        image: ${{ needs.plan.outputs.postgres == 'true' && 'postgres:16' || '' }}
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: fix_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d fix_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      FIX_KIND: ${{ inputs.kind }}
+      FIX_SHA: ${{ inputs.sha }}
+      FIX_REPO: ${{ github.repository }}
+      FIX_REQUEST: ${{ inputs.request }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+
+      - name: Pull the image
+        # Before the script's own time limit starts.
+        env:
+          IMAGE: ${{ needs.plan.outputs.image }}
+        run: docker pull --quiet "$IMAGE"
+
+      - name: Run the script
+        timeout-minutes: ${{ fromJSON(needs.plan.outputs.timeout) }}
+        env:
+          IMAGE: ${{ needs.plan.outputs.image }}
+          SCRIPT: ${{ needs.plan.outputs.script }}
+          POSTGRES: ${{ needs.plan.outputs.postgres }}
+          # The service above, reached through the runner's port 5432
+          # (--network host). Passed on only when fix.json declares postgres:16.
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGUSER: postgres
+          PGPASSWORD: postgres
+          PGDATABASE: fix_test
+          DATABASE_URL_TEST: postgresql://postgres:postgres@127.0.0.1:5432/fix_test
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          [ "$FIX_KIND" = test ] || fail "this repository is merge-only: only the test job runs here"
+          # Each variable goes in by name (-e NAME), so docker reads its value
+          # from this step's environment and no value is on a command line.
+          args=(--rm --network host -v "$PWD":/work -w /work
+            -e FIX_KIND -e FIX_SHA -e FIX_REPO -e FIX_REQUEST)
+          if [ "$POSTGRES" = true ]; then
+            args+=(-e PGHOST -e PGPORT -e PGUSER -e PGPASSWORD -e PGDATABASE -e DATABASE_URL_TEST)
+          fi
+          echo "bash $SCRIPT in $IMAGE"
+          docker run "${args[@]}" "$IMAGE" bash "$SCRIPT"
